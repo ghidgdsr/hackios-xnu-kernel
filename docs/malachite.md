@@ -55,7 +55,9 @@ by itself. Three facilities, all requested from the payload's cmdline:
   4 GiB into `userdata` every 10 seconds, with a magic, a sequence number and a
   CRC. A later `showprev=1` run draws the newest valid slot; `showprev=ustacks`
   draws only its `ustacks:` lines. This is how the log is read back from a phone
-  that cannot be photographed and whose fastboot cannot read partitions.
+  that cannot be photographed and whose fastboot cannot read partitions. Where
+  the raw region can be obtained another way, `tools/parse-logslots.py` decodes
+  the two slots on the host.
 
 `ustacks_probe=1` adds a second monitor footer line with the kernel's own
 `ustacks_*` state (the thread call pointer, the parsed name and filter, and the
