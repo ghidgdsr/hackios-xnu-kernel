@@ -1078,7 +1078,10 @@ static void stage_corner(uint32_t argb, int right, int bottom, unsigned px);
 static void fb_render_log(const char *log, uint64_t len, uint32_t fg);
 static void monitor_footer(uint64_t new_bytes, unsigned hidden);
 static void monitor_heartbeat(void);
-static void monitor_ustacks(uint64_t slide);
+static void monitor_sampler(void);
+static void sample_threads(const char *want);
+static uint32_t sampler_to_text(char *d, uint32_t cap, uint32_t at);
+static uint64_t kslide;                /* the kernel's slide, as the monitor reads the log with */
 static unsigned fb_reserve_rows;       /* rows the monitor keeps for its footer */
 static unsigned monitor_cycle;         /* passes of the monitor loop: the heartbeat */
 
@@ -1280,7 +1283,7 @@ struct monitor_args {
 	uint64_t slot_bio;                     /* userdata's Block I/O, 0 when there is none */
 	uint64_t slot_first, slot_blocks;      /* its first LBA and size, in media blocks */
 	uint64_t slot_block_size;
-	uint64_t ustacks_probe;                /* ustacks_probe=1: show the kernel's sampler globals */
+	uint64_t sampler;                      /* sampler=1: read the kernel's threads on this core */
 };
 
 /*
@@ -1330,13 +1333,17 @@ monitor_main(void)
 	uint64_t freq = READ_SYSREG(CNTFRQ_EL0);
 	uint64_t last_save = 0;
 
+	kslide = monitor_args.slide;
 	for (;;) {
 		uint64_t started, now;
 
 		if (live != NULL) {
 			now = READ_SYSREG(CNTVCT_EL0);
-			fb_reserve_rows = monitor_args.ustacks_probe != 0 ? 2 : 1;
+			fb_reserve_rows = monitor_args.sampler != 0 ? 2 : 1;
 			render_kernel_log(live, monitor_args.slide);
+			if (monitor_args.sampler != 0) {
+				sample_threads("lsd");
+			}
 			/*
 			 * The log is put on the storage as it stands every ten seconds: the last slot
 			 * written before a hang is what a "showprev=1" run (or mtkclient) gets back.
@@ -1347,8 +1354,8 @@ monitor_main(void)
 			}
 			monitor_footer(log_new_bytes, log_hidden);
 			monitor_heartbeat();
-			if (monitor_args.ustacks_probe != 0) {
-				monitor_ustacks(monitor_args.slide);
+			if (monitor_args.sampler != 0) {
+				monitor_sampler();
 			}
 		}
 		monitor_cycle++;
@@ -3113,6 +3120,9 @@ save_log_slot(const struct kernel_live *live, uint64_t slide)
 		log_slot_state = -2;            /* the kernel's own transfer list is in the controller */
 		return;
 	}
+	if (monitor_args.sampler != 0) {
+		n = sampler_to_text((char *)log_slot_buf + text_off, LOG_SLOT_SIZE - text_off, n);
+	}
 	log_slot_seq++;
 	memset(h, 0, sizeof(*h));
 	h->magic = LOG_SLOT_MAGIC;
@@ -3141,7 +3151,7 @@ save_log_slot(const struct kernel_live *live, uint64_t slide)
 extern char __ImageBase;
 
 static void
-monitor_start(const struct kernel_live *live, uint64_t slide, uint64_t probe, uint64_t save)
+monitor_start(const struct kernel_live *live, uint64_t slide, uint64_t sampler_flag, uint64_t save)
 {
 	uint8_t *base = (uint8_t *)(uintptr_t)&__ImageBase;
 	uint32_t pe_off, image_size;
@@ -3153,7 +3163,7 @@ monitor_start(const struct kernel_live *live, uint64_t slide, uint64_t probe, ui
 	}
 	monitor_args.live = (uint64_t)(uintptr_t)live;
 	monitor_args.slide = slide;
-	monitor_args.ustacks_probe = probe;
+	monitor_args.sampler = sampler_flag;
 	monitor_args.ttbr0 = READ_SYSREG(TTBR0_EL1);
 	monitor_args.tcr = READ_SYSREG(TCR_EL1);
 	monitor_args.mair = READ_SYSREG(MAIR_EL1);
@@ -3990,71 +4000,335 @@ monitor_heartbeat(void)
 }
 
 /*
- * The second bottom line with ustacks_probe=1: the kernel's own sampler state, read where it
- * lives (the addresses are the kernel's symbol table's, unslid; the monitor's slide makes them
- * readable on its core too). "call" is the thread call ustacks_init allocated -- 0 means the boot
- * argument was not taken; "cnt" is ustacks_count as it stands, and it falls by one for every fire,
- * so a value that never moves while call is set is a thread call that never ran. A cnt that falls
- * while the log has no "ustacks:" lines is a fire that found no process of that name.
+ * The kernel's threads, read from the monitor core: the register values a frozen panel cannot
+ * give. There is no debugger on the phone and the kernel's own sampler never fires, so this walks
+ * the kernel's task and thread lists and reads each thread's saved user state.
  *
- * The addresses belong to prebuilt/mach.development.bcm2837, the kernel these images carry; a
- * rebuilt one moves them, and this line would then only be showing whatever happened to be there.
+ * The addresses and offsets are the kernel's own (prebuilt/mach.development.bcm2837). The ptov
+ * table is read at run time from the image, so a kernel heap pointer becomes a physical address
+ * this core can read without calling into the kernel. Every read is bounds-checked: a pointer
+ * that does not translate reads as zero and the walk stops.
  */
-#define USTACKS_NAME_VA    0xfffffff007e7e000ULL
-#define USTACKS_CALL_VA    0xfffffff007e7e020ULL
-#define USTACKS_COUNT_VA   0xfffffff007e7e068ULL
-#define USTACKS_EVERY_VA   0xfffffff007e7e06cULL
-#define USTACKS_THREADS_VA 0xfffffff007af5268ULL
-#define USTACKS_TNAME_VA   0xfffffff007e8a780ULL
+#define KV_PTOV_TABLE       0xfffffff0071b5040ULL   /* struct ptov_table_entry[], 0x18 bytes each */
+#define KV_PTOV_ENTRIES     8
+#define KV_PROC_STRUCT_SIZE 0xfffffff007b19cd8ULL   /* u64: task - proc */
+#define KV_TASKS            0xfffffff007b4c550ULL   /* queue_head_t tasks */
+#define KTASK_TASKS         0x58    /* queue_chain_t inside task: next at +0, prev at +8 */
+#define KTASK_THREADS       0x80    /* queue_head_t inside task */
+#define KTHREAD_CHAIN       0x410   /* queue_chain_t inside thread */
+#define KTHREAD_STATE       0x1f0   /* int state */
+#define KTHREAD_SAVED       0x110   /* arm_saved_state_t * */
+#define KPROC_NAME          0x5b8   /* char p_name[] */
+#define KSS_MAGIC           0x15    /* uint32 at the saved state: a 64-bit user state */
+#define KSS_FP              0xf0
+#define KSS_LR              0xf8
+#define KSS_SP              0x100
+#define KSS_PC              0x108
 
+#define SAMPLER_THREADS     16
+#define SAMPLER_NAME        32
+
+struct sampler_thread {
+	uint64_t pc, lr, fp;
+	uint32_t state;
+};
+
+static struct {
+	uint64_t task, proc;
+	unsigned threads;
+	int found;
+	char name[SAMPLER_NAME];
+	struct sampler_thread t[SAMPLER_THREADS];
+} sampler;
+
+static int
+kva_to_pa(uint64_t va, uint64_t *pa)
+{
+	uint64_t table = KV_PTOV_TABLE + kslide;
+
+	if ((va >> 48) != 0xffff) {
+		return 0;
+	}
+	for (unsigned i = 0; i < KV_PTOV_ENTRIES; i++) {
+		uint64_t pa_i = *(volatile uint64_t *)(uintptr_t)(table + i * 0x18);
+		uint64_t va_i = *(volatile uint64_t *)(uintptr_t)(table + i * 0x18 + 8);
+		uint64_t len = *(volatile uint64_t *)(uintptr_t)(table + i * 0x18 + 0x10);
+
+		if (len == 0 || len > (1ULL << 40) || va_i < (1ULL << 63)) {
+			continue;
+		}
+		if (va < va_i || va - va_i + 8 > len) {
+			continue;
+		}
+		pa_i += va - va_i;
+		/* keep the read inside the phone's DRAM */
+		if (pa_i < 0x40000000ULL || pa_i >= 0x400000000ULL) {
+			return 0;
+		}
+		*pa = pa_i;
+		return 1;
+	}
+	return 0;
+}
+
+static int
+kread64(uint64_t va, uint64_t *out)
+{
+	uint64_t pa;
+
+	if (!kva_to_pa(va, &pa)) {
+		return 0;
+	}
+	*out = *(volatile uint64_t *)(uintptr_t)pa;
+	return 1;
+}
+
+static uint32_t
+kread32(uint64_t va)
+{
+	uint64_t pa;
+
+	if (!kva_to_pa(va, &pa)) {
+		return 0;
+	}
+	return *(volatile uint32_t *)(uintptr_t)pa;
+}
+
+/* Does the NUL-terminated name at this kernel address equal want? */
+static int
+kname_is(uint64_t va, const char *want)
+{
+	uint64_t w[4];
+	char name[SAMPLER_NAME];
+
+	for (unsigned i = 0; i < 4; i++) {
+		if (!kread64(va + i * 8, &w[i])) {
+			return 0;
+		}
+	}
+	__builtin_memcpy(name, w, sizeof(name));
+	name[sizeof(name) - 1] = 0;
+	for (unsigned i = 0; i < sizeof(name); i++) {
+		if (name[i] != want[i]) {
+			return 0;
+		}
+		if (want[i] == 0) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/*
+ * One pass over the kernel's task list: find the process called want and take the saved state of
+ * each of its threads. The user state's pc/lr/fp is where the thread was when it last trapped;
+ * for a thread blocked in a system call that is the call site in user space.
+ */
 static void
-monitor_ustacks(uint64_t slide)
+sample_threads(const char *want)
+{
+	uint64_t head, node, size, task = 0, proc = 0, thead, tnode;
+	unsigned n = 0;
+
+	sampler.found = 0;
+	sampler.threads = 0;
+	sampler.task = sampler.proc = 0;
+	sampler.name[0] = 0;
+
+	size = *(volatile uint64_t *)(uintptr_t)(KV_PROC_STRUCT_SIZE + kslide);
+	if (size < 0x100 || size > 0x40000) {
+		size = 0x780;
+	}
+	head = KV_TASKS + kslide;
+	node = *(volatile uint64_t *)(uintptr_t)head;
+	for (unsigned i = 0; i < 1024 && node != head; i++) {
+		task = node - KTASK_TASKS;
+		proc = task - size;
+		if (kname_is(proc + KPROC_NAME, want)) {
+			sampler.found = 1;
+			break;
+		}
+		if (!kread64(task + KTASK_TASKS, &node)) {
+			return;
+		}
+	}
+	if (!sampler.found) {
+		return;
+	}
+	sampler.task = task;
+	sampler.proc = proc;
+	for (unsigned i = 0; i < 4; i++) {
+		uint64_t w;
+
+		if (!kread64(proc + KPROC_NAME + i * 8, &w)) {
+			break;
+		}
+		__builtin_memcpy(sampler.name + i * 8, &w, 8);
+	}
+	sampler.name[sizeof(sampler.name) - 1] = 0;
+
+	thead = task + KTASK_THREADS;
+	if (!kread64(thead, &tnode)) {
+		return;
+	}
+	for (unsigned i = 0; i < 512 && tnode != thead && n < SAMPLER_THREADS; i++) {
+		uint64_t thread = tnode - KTHREAD_CHAIN;
+		uint64_t st = 0;
+
+		sampler.t[n].state = kread32(thread + KTHREAD_STATE);
+		sampler.t[n].pc = sampler.t[n].lr = sampler.t[n].fp = 0;
+		if (kread64(thread + KTHREAD_SAVED, &st) && st != 0 && kread32(st) == KSS_MAGIC) {
+			if (!kread64(st + KSS_PC, &sampler.t[n].pc)) {
+				sampler.t[n].pc = 0;
+			}
+			if (!kread64(st + KSS_LR, &sampler.t[n].lr)) {
+				sampler.t[n].lr = 0;
+			}
+			if (!kread64(st + KSS_FP, &sampler.t[n].fp)) {
+				sampler.t[n].fp = 0;
+			}
+		}
+		n++;
+		if (!kread64(thread + KTHREAD_CHAIN, &tnode)) {
+			break;
+		}
+	}
+	sampler.threads = n;
+}
+
+/* The second footer line: the process, its thread count, and one thread per pass. */
+static void
+monitor_sampler(void)
 {
 	char buf[192];
-	static const char lead[] = "ustacks call=";
-	unsigned n = 0;
-	uint64_t call = *(volatile uint64_t *)(uintptr_t)(USTACKS_CALL_VA + slide);
-	uint32_t count = *(volatile uint32_t *)(uintptr_t)(USTACKS_COUNT_VA + slide);
-	uint32_t every = *(volatile uint32_t *)(uintptr_t)(USTACKS_EVERY_VA + slide);
-	uint32_t threads = *(volatile uint32_t *)(uintptr_t)(USTACKS_THREADS_VA + slide);
-	const char *name = (const char *)(uintptr_t)(USTACKS_NAME_VA + slide);
-	const char *tname = (const char *)(uintptr_t)(USTACKS_TNAME_VA + slide);
+	static const char lead[] = "kernel sampler: ";
+	unsigned n = 0, k;
 	uint64_t rows;
 
-#define PUT_LIT(s) do { \
-	for (unsigned i_ = 0; (s)[i_] != 0 && n < sizeof(buf) - 1; i_++) { \
-		buf[n++] = (s)[i_]; \
-	} \
-} while (0)
-#define PUT_TEXT(s) do { \
-	for (unsigned i_ = 0; i_ < 31 && (s)[i_] != 0 && n < sizeof(buf) - 1; i_++) { \
-		char ch_ = (s)[i_]; \
-		buf[n++] = (ch_ >= 32 && ch_ < 127) ? ch_ : '.'; \
-	} \
-} while (0)
+	if (!sampler.found) {
+		static const char none[] = "kernel sampler: lsd not found";
 
-	PUT_LIT(lead);
-	n += fb_hex(buf + n, call);
-	PUT_LIT(" name=");
-	PUT_TEXT(name);
-	PUT_LIT(" cnt=");
-	n += fb_u64(buf + n, count);
-	PUT_LIT(" ev=");
-	n += fb_u64(buf + n, every);
-	PUT_LIT(" thr=");
-	n += fb_u64(buf + n, threads);
-	PUT_LIT(" tn=");
-	PUT_TEXT(tname);
+		rows = (SCREEN.height > FB_Y0 + FB_CELL_H) ? (SCREEN.height - FB_Y0 - 8) / FB_CELL_H : 0;
+		if (rows < 2) {
+			return;
+		}
+		fb_row_clear(rows - 2);
+		fb_line((unsigned)(rows - 2), none, 0xFFFF8080u);
+		return;
+	}
+	for (unsigned i = 0; lead[i] != 0 && n < sizeof(buf) - 1; i++) {
+		buf[n++] = lead[i];
+	}
+	for (unsigned i = 0; sampler.name[i] != 0 && i < 20 && n < sizeof(buf) - 1; i++) {
+		char c = sampler.name[i];
+
+		buf[n++] = (c >= 32 && c < 127) ? c : '.';
+	}
+	buf[n++] = ' ';
+	n += fb_u64(buf + n, sampler.threads);
+	k = sampler.threads != 0 ? monitor_cycle % sampler.threads : 0;
+	if (sampler.threads == 0) {
+		buf[n] = 0;
+		goto draw;
+	}
+	buf[n++] = 't';
+	buf[n++] = '#';
+	n += fb_u64(buf + n, k);
+	buf[n++] = ' ';
+	for (unsigned i = 0; i < 2 && n < sizeof(buf) - 1; i++) {
+		static const char names[2][4] = { "st=", "pc=" };
+
+		for (unsigned j = 0; names[i][j] != 0; j++) {
+			buf[n++] = names[i][j];
+		}
+		if (i == 0) {
+			n += fb_u64(buf + n, sampler.t[k].state);
+		} else {
+			n += fb_hex(buf + n, sampler.t[k].pc);
+		}
+		buf[n++] = ' ';
+	}
+	for (unsigned i = 0; i < 3; i++) {
+		buf[n++] = "lr="[i];
+	}
+	n += fb_hex(buf + n, sampler.t[k].lr);
 	buf[n] = 0;
-#undef PUT_TEXT
-#undef PUT_LIT
 
+draw:
 	rows = (SCREEN.height > FB_Y0 + FB_CELL_H) ? (SCREEN.height - FB_Y0 - 8) / FB_CELL_H : 0;
 	if (rows < 2) {
 		return;
 	}
 	fb_row_clear(rows - 2);
 	fb_line((unsigned)(rows - 2), buf, 0xFFB0B0FFu);
+}
+
+static unsigned
+put_str(char *d, unsigned n, unsigned cap, const char *s)
+{
+	while (*s != 0 && n < cap) {
+		d[n++] = *s++;
+	}
+	return n;
+}
+
+static unsigned
+put_hex(char *d, unsigned n, unsigned cap, uint64_t v)
+{
+	char tmp[20];
+	unsigned k = fb_hex(tmp, v);
+
+	for (unsigned i = 0; i < k && n < cap; i++) {
+		d[n++] = tmp[i];
+	}
+	return n;
+}
+
+static unsigned
+put_dec(char *d, unsigned n, unsigned cap, uint64_t v)
+{
+	char tmp[24];
+	unsigned k = fb_u64(tmp, v);
+
+	for (unsigned i = 0; i < k && n < cap; i++) {
+		d[n++] = tmp[i];
+	}
+	return n;
+}
+
+/*
+ * The sampler snapshot as text, appended to the log a slot saves: the same values as the footer
+ * line, all the threads, so they can be read back with showprev=1 instead of transcribed.
+ */
+static uint32_t
+sampler_to_text(char *d, uint32_t cap, uint32_t at)
+{
+	unsigned n = at;
+
+	n = put_str(d, n, cap, "\n== monitor thread sampler ==\n");
+	if (!sampler.found) {
+		return put_str(d, n, cap, "lsd: not found\n");
+	}
+	n = put_str(d, n, cap, "process ");
+	n = put_str(d, n, cap, sampler.name);
+	n = put_str(d, n, cap, ", threads ");
+	n = put_dec(d, n, cap, sampler.threads);
+	n = put_str(d, n, cap, "\n");
+	for (unsigned i = 0; i < sampler.threads; i++) {
+		n = put_str(d, n, cap, " t");
+		n = put_dec(d, n, cap, i);
+		n = put_str(d, n, cap, " state ");
+		n = put_dec(d, n, cap, sampler.t[i].state);
+		n = put_str(d, n, cap, " pc ");
+		n = put_hex(d, n, cap, sampler.t[i].pc);
+		n = put_str(d, n, cap, " lr ");
+		n = put_hex(d, n, cap, sampler.t[i].lr);
+		n = put_str(d, n, cap, " fp ");
+		n = put_hex(d, n, cap, sampler.t[i].fp);
+		n = put_str(d, n, cap, "\n");
+	}
+	n = put_str(d, n, cap, "== end sampler ==\n");
+	return n;
 }
 
 /*
@@ -4830,7 +5104,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	int monitor_requested = 0;
 	int kret_hold = 0;
 	int showprev_mode = 0;         /* showprev=1: the saved log; showprev=ustacks: its ustacks lines */
-	int ustacks_probe = 0;         /* ustacks_probe=1: the monitor shows ustacks_*'s state too */
+	int sampler_requested = 0;     /* sampler=1: the monitor reads the kernel's threads too */
 	int monitor_save = 1;          /* monitor_save=0: the monitor keeps the log in RAM only */
 	/* "torch=N" (not 0) there too: the phone's flashlight is the kernel's (bsd/dev/redwood_torch.c) */
 	int torch_requested = 0;
@@ -4867,8 +5141,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		    (c[11] == 0 || c[11] == ' ');
 		monitor_requested |= starts_with(c, "monitor=1") && (c == pi.cmdline || c[-1] == ' ') &&
 		    (c[9] == 0 || c[9] == ' ');
-		ustacks_probe |= starts_with(c, "ustacks_probe=1") && (c == pi.cmdline || c[-1] == ' ') &&
-		    (c[15] == 0 || c[15] == ' ');
+		sampler_requested |= starts_with(c, "sampler=1") && (c == pi.cmdline || c[-1] == ' ') &&
+		    (c[9] == 0 || c[9] == ' ');
 		if (starts_with(c, "monitor_save=0") && (c == pi.cmdline || c[-1] == ' ') &&
 		    (c[14] == 0 || c[14] == ' ')) {
 			monitor_save = 0;
@@ -5478,7 +5752,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	 * never comes back (the system image boot is one).
 	 */
 	if (monitor_requested && kernel_mpidr == this_mpidr) {
-		monitor_start(kernel_live, slide, ustacks_probe, monitor_save);
+		monitor_start(kernel_live, slide, sampler_requested, monitor_save);
 	}
 	print("jumping to %x\n", entry_va + slide);
 	stage_paint(STAGE_WHITE);
