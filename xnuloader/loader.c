@@ -4142,7 +4142,7 @@ sample_threads(const char *want)
 	head = KV_TASKS + kslide;
 	node = *(volatile uint64_t *)(uintptr_t)head;
 	for (unsigned i = 0; i < 1024 && node != head; i++) {
-		task = node - KTASK_TASKS;
+		task = node;            /* the queue holds element pointers, not chain addresses */
 		proc = task - size;
 		if (kname_is(proc + KPROC_NAME, want)) {
 			sampler.found = 1;
@@ -4172,7 +4172,7 @@ sample_threads(const char *want)
 		return;
 	}
 	for (unsigned i = 0; i < 512 && tnode != thead && n < SAMPLER_THREADS; i++) {
-		uint64_t thread = tnode - KTHREAD_CHAIN;
+		uint64_t thread = tnode;
 		uint64_t st = 0;
 
 		sampler.t[n].state = kread32(thread + KTHREAD_STATE);
