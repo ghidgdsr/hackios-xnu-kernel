@@ -15,7 +15,11 @@
 /* ------------------------------------------------------------------------ */
 /* Fixed conventions shared with the boot shim, the packer and the kernel   */
 
+/* Where the boot shim copies the XNUP container; a device whose memory map places it elsewhere
+ * (malachite: above 4 GiB) passes -DPAYLOAD_BASE=... at build time. */
+#ifndef PAYLOAD_BASE
 #define PAYLOAD_BASE        0xF0000000ULL
+#endif
 #define PAYLOAD_MAGIC       0x50554E58u /* "XNUP" */
 
 struct payload_header { uint32_t magic; uint32_t size; };
@@ -40,6 +44,10 @@ struct payload_entry { char name[16]; uint32_t size; uint32_t reserved; };
 #define NVRAM_BANK_SIZE     0x2000u
 #define PANIC_LOG_BASE      (PAYLOAD_BASE + PAYLOAD_MAX_SIZE - 0x100000ULL)
 #define PAYLOAD_MAX_SIZE    0x04000000ULL         /* RAM reserved for the payload in the UEFI memory map */
+/* Bring-up: a mailbox the firmware reads after this loader returns (see XnuLoader.c). */
+#define LOG_MBOX_BASE       (PAYLOAD_BASE + PAYLOAD_MAX_SIZE - 0x80000ULL)
+#define LOG_MBOX_MAGIC      0x474F4C58u           /* "XLOG" */
+#define LOG_MBOX_SIZE       0x7F000u
 
 /* ------------------------------------------------------------------------ */
 /* XNU structures (pexpert/pexpert/arm64/boot.h, mach-o/loader.h)           */
@@ -553,6 +561,18 @@ static const struct platform platform_redwood = {
 	.fb_base = 0xE1000000,
 };
 
+static const struct platform platform_malachite = {
+	/* POCO X7 / Redmi Note 14 Pro 5G, MT6878 (Dimensity 7300): GICv3, PSCI over SMC.
+	 * The peripheral window follows redwood's: MTK's GIC (0x0C000000), pinctrl (0x10005000)
+	 * and watchdog (0x1C00A000) all fall inside 0x00400000..0x40000000. */
+	.name = "malachite", .io_base = 0x00400000, .io_size = 0x3FC00000,
+	.gic_dist = 0x0C000000, .gic_redist = 0x0C040000, .uart = 0, .log_other_cpu = 1,
+	.cores = 8, .core_shift = 8,       /* cpu@N reg = 0xN00: MPIDR's second affinity field */
+	.small_cores = 0x0f,               /* cpu0-3: Cortex-A55 (capacity-dmips-mhz 267), cpu4-7: A78 */
+	.fb_base = 0xFD91F000,             /* LK's scanout buffer, top of the first 4 GiB; it can move
+	                                    * with the RAM size, so efi_main also matches by range */
+};
+
 /*
  * The devices the loader knows, told apart by the framebuffer base their UEFI reports. A port to another
  * device adds its description here (common/new-device.sh writes a starting point, docs/PORTING.md says
@@ -560,6 +580,7 @@ static const struct platform platform_redwood = {
  */
 static const struct platform *const platforms[] = {
 	&platform_redwood,
+	&platform_malachite,
 };
 
 /* ------------------------------------------------------------------------ */
@@ -2503,6 +2524,8 @@ struct payload_info {
 	uint64_t forced_base;
 	uint64_t resident_rd;           /* size of a root image the host put at the resident address */
 	int usb_mode;
+	int hold;                       /* bring-up aid: stay on the log screen instead of resetting */
+	int nokernel;                   /* bring-up aid: stop after the payload is read, never enter the kernel */
 };
 
 static uint64_t
@@ -2555,6 +2578,10 @@ parse_payload(struct payload_info *pi, int verbose)
 			pi->checkpoint = parse_number(text, 10);  /* where the kernel should stop and come back */
 		} else if (str_eq(e->name, "usb")) {
 			pi->usb_mode = 1;                         /* stay in the loader and take commands over USB */
+		} else if (str_eq(e->name, "hold")) {
+			pi->hold = 1;                             /* bring-up: keep the log on screen, no reset */
+		} else if (str_eq(e->name, "nokernel")) {
+			pi->nokernel = 1;                         /* bring-up: stop after the payload is read */
 		}
 		p += sizeof(*e) + ((e->size + 15) & ~15u);
 	}
@@ -2619,6 +2646,35 @@ static struct {
 static uint64_t win_base, win_size; /* XNU's physical memory window, claimed once */
 static uint64_t resident_rd_size;   /* root image kept at win_base + RESIDENT_RD_OFFSET, 0 if none */
 static char last_result[64] = "idle";
+
+#ifdef MALACHITE_STAGES
+/*
+ * Bring-up on a device with no USB link: the UEFI's text console may be missing
+ * or unreadable, so the last stage reached is painted on the whole panel, the
+ * way the UEFI port's SEC does it. Words are 0xAARRGGBB as the panel scans them
+ * out (0xFFFF0000 is red).
+ */
+#define STAGE_BLUE     0xFF0000FFu      /* loader started, platform chosen */
+#define STAGE_RED      0xFFFF0000u      /* no payload, or the kernel failed to start */
+#define STAGE_CYAN     0xFF00FFFFu      /* payload read */
+#define STAGE_MAGENTA  0xFFFF00FFu      /* entering the kernel (self test) */
+#define STAGE_GREEN    0xFF00FF00u      /* run_kernel returned */
+
+static void
+stage_paint(uint32_t argb)
+{
+	if (SCREEN.base == 0 || SCREEN.stride == 0 || SCREEN.height == 0) {
+		return;
+	}
+	volatile uint32_t *p = (volatile uint32_t *)(uintptr_t)SCREEN.base;
+	uint64_t n = (uint64_t)(SCREEN.stride / 4) * SCREEN.height;
+	for (uint64_t i = 0; i < n; i++) {
+		p[i] = argb;
+	}
+}
+#else
+#define stage_paint(c) do { } while (0)
+#endif
 
 static void
 set_result(const char *what, uint64_t a, uint64_t b)
@@ -3872,11 +3928,13 @@ fw_cfg_read(void *buf, uint32_t len)
 static void
 ramfb_phone_screen(void)
 {
-	static struct {
+	static volatile struct {
 		uint64_t addr;
 		uint32_t fourcc, flags, width, height, stride;
 	} __attribute__((packed)) cfg;
-	static struct {
+	/* the device writes the control word back: it must be read from memory after the request,
+	 * not from a register the compiler kept its own copy in */
+	static volatile struct {
 		uint32_t control, length;
 		uint64_t address;
 	} dma;
@@ -3930,6 +3988,17 @@ efi_main(efi_handle image, efi_system_table *st)
 	static const efi_guid gop_guid = EFI_GOP_GUID;
 	struct payload_info pi;
 
+#ifdef MALACHITE_ENTRY_PAINT
+	/* First instruction of the loader: no EFI call has been made yet. Magenta here means
+	 * the firmware really transferred control; anything later is a hang after this point. */
+	{
+		volatile uint32_t *px = (volatile uint32_t *)(uintptr_t)0xFD91F000;
+		for (uint64_t i = 0; i < (uint64_t)1248 * 2712; i++) {
+			px[i] = 0xFFFF00FFu;
+		}
+	}
+#endif
+
 	ST = st;
 	BS = st->bs;
 	IMAGE = image;
@@ -3951,16 +4020,50 @@ efi_main(efi_handle image, efi_system_table *st)
 		for (unsigned i = 0; i < sizeof(platforms) / sizeof(platforms[0]); i++)
 			if (platforms[i]->fb_base == SCREEN.base)
 				PLAT = platforms[i];
+		/*
+		 * malachite's LK places the scanout buffer at the top of the first 4 GiB and the
+		 * exact address depends on the RAM size; keep it away from the QEMU ramfb path
+		 * (fw_cfg does not exist on a phone).
+		 */
+		if (PLAT == &platform_qemu_virt && SCREEN.base >= 0xF0000000ULL && SCREEN.base < 0x100000000ULL)
+			PLAT = &platform_malachite;
 		if (PLAT == &platform_qemu_virt)
 			ramfb_phone_screen();
 		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
 	}
 	print("platform %s\n", PLAT->name);
+	stage_paint(STAGE_BLUE);
 
 	install_exception_hook();
 	wdt_arm();
 
 	int have_payload = parse_payload(&pi, 0);
+	stage_paint(have_payload ? STAGE_CYAN : STAGE_RED);
+	if (have_payload && pi.nokernel) {
+		/* Bring-up: show what the payload holds, hand the log to the firmware and return.
+		 * The EFI console has no output device on this port yet; the firmware's own
+		 * DEBUG console does (FrameBufferSerialPortLib), so it prints this for us. */
+		parse_payload(&pi, 1);
+		print("nokernel: payload read; not entering the kernel\n");
+		print("display %d x %d, stride %d, platform %s\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height,
+		    (uint64_t)SCREEN.stride, PLAT->name);
+		/* Green on the visible part of the panel: the loader got this far. The console
+		 * cursor lives at the end of the whole reserved region, far past this fill. */
+		if (SCREEN.base != 0 && SCREEN.stride != 0 && SCREEN.height != 0) {
+			volatile uint32_t *px = (volatile uint32_t *)(uintptr_t)SCREEN.base;
+			uint64_t count = (uint64_t)(SCREEN.stride / 4) * SCREEN.height;
+			for (uint64_t i = 0; i < count; i++) {
+				px[i] = 0xFF00FF00u;
+			}
+		}
+		volatile uint32_t *mbox = (volatile uint32_t *)(uintptr_t)LOG_MBOX_BASE;
+		uint32_t n = log_len < LOG_MBOX_SIZE ? log_len : LOG_MBOX_SIZE;
+		mbox[0] = LOG_MBOX_MAGIC;
+		mbox[1] = n;
+		memcpy((void *)(uintptr_t)(LOG_MBOX_BASE + 8), log_buf, n);
+		((volatile char *)(uintptr_t)(LOG_MBOX_BASE + 8))[n] = 0;
+		return 0;
+	}
 	if (have_payload && pi.usb_mode && usb_start()) {
 		flush_log();
 		usb_command_loop();
@@ -3968,7 +4071,16 @@ efi_main(efi_handle image, efi_system_table *st)
 
 	/* One-shot mode: run the kernel that came with the image, then reset. */
 	if (have_payload) {
+		stage_paint(STAGE_MAGENTA);
 		run_kernel(0, 0);
+		stage_paint(STAGE_GREEN);
+		if (pi.hold) {
+			/* A device with no USB link yet: leave the log where it can be photographed. */
+			print("holding (payload hold=1): power-cycle to leave\n");
+			for (;;) {
+				__asm__ volatile("wfi");
+			}
+		}
 	}
 	reboot();
 	return 0;
