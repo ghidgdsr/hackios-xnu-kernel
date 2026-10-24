@@ -1334,7 +1334,9 @@ monitor_main(void)
 {
 	const struct kernel_live *live = (const struct kernel_live *)(uintptr_t)monitor_args.live;
 	uint64_t freq = READ_SYSREG(CNTFRQ_EL0);
-	uint64_t last_save = 0;
+	uint64_t last_save = 0, last_bytes = 0;
+	unsigned silent = 0;
+	int saved_silent = 0;
 
 	kslide = monitor_args.slide;
 	for (;;) {
@@ -1347,13 +1349,25 @@ monitor_main(void)
 			if (monitor_args.sampler != 0) {
 				sample_threads("lsd");
 			}
+			if (log_new_bytes != last_bytes) {
+				last_bytes = log_new_bytes;
+				silent = 0;
+				saved_silent = 0;
+			} else if (silent < 1000000) {
+				silent++;
+			}
 			/*
-			 * The log is put on the storage as it stands every ten seconds: the last slot
-			 * written before a hang is what a "showprev=1" run (or mtkclient) gets back.
+			 * The log is put on the storage as it stands every five seconds, and once
+			 * more when it has stood still for three passes: the last slot a frozen
+			 * kernel leaves then ends within a few seconds of its last line.
 			 */
-			if (monitor_args.slot_bio != 0 && now - last_save >= 10 * freq) {
+			if (monitor_args.slot_bio != 0 &&
+			    (now - last_save >= 5 * freq || (silent >= 3 && !saved_silent))) {
 				last_save = now;
 				save_log_slot(live, monitor_args.slide);
+				if (silent >= 3) {
+					saved_silent = 1;
+				}
 			}
 			monitor_footer(log_new_bytes, log_hidden);
 			monitor_heartbeat();
@@ -1363,7 +1377,7 @@ monitor_main(void)
 		}
 		monitor_cycle++;
 		started = READ_SYSREG(CNTVCT_EL0);
-		while (READ_SYSREG(CNTVCT_EL0) - started < 2 * freq) {
+		while (READ_SYSREG(CNTVCT_EL0) - started < freq) {
 		}
 	}
 }
