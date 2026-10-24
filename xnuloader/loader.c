@@ -1085,6 +1085,8 @@ static unsigned put_str(char *d, unsigned n, unsigned cap, const char *s);
 static unsigned put_hex(char *d, unsigned n, unsigned cap, uint64_t v);
 static unsigned put_dec(char *d, unsigned n, unsigned cap, uint64_t v);
 static uint64_t kslide;                /* the kernel's slide, as the monitor reads the log with */
+static uint32_t sysimg_crc_value;      /* CRC-32 of the system image as it was read into RAM */
+static int sysimg_crc_valid;
 static unsigned fb_reserve_rows;       /* rows the monitor keeps for its footer */
 static unsigned monitor_cycle;         /* passes of the monitor loop: the heartbeat */
 
@@ -1287,6 +1289,7 @@ struct monitor_args {
 	uint64_t slot_first, slot_blocks;      /* its first LBA and size, in media blocks */
 	uint64_t slot_block_size;
 	uint64_t sampler;                      /* sampler=1: read the kernel's threads on this core */
+	uint64_t sysimg_crc;                   /* CRC-32 of the system image as the loader read it */
 };
 
 /*
@@ -1666,6 +1669,39 @@ ufs_crc32(const uint8_t *p, uint64_t n)
 		for (int k = 0; k < 8; k++) {
 			c = (c >> 1) ^ (0xedb88320u & (0u - (c & 1)));
 		}
+	}
+	return ~c;
+}
+
+/* The same CRC, table-driven: the 2.4 GB system image is far too slow bit by bit. */
+static uint32_t crc32_table[256];
+static int crc32_table_ready;
+
+static void
+crc32_init(void)
+{
+	if (crc32_table_ready) {
+		return;
+	}
+	for (uint32_t i = 0; i < 256; i++) {
+		uint32_t c = i;
+
+		for (int k = 0; k < 8; k++) {
+			c = (c >> 1) ^ (0xedb88320u & (0u - (c & 1)));
+		}
+		crc32_table[i] = c;
+	}
+	crc32_table_ready = 1;
+}
+
+static uint32_t
+crc32_fast(const uint8_t *p, uint64_t n)
+{
+	uint32_t c = 0xffffffffu;
+
+	crc32_init();
+	for (uint64_t i = 0; i < n; i++) {
+		c = crc32_table[(c ^ p[i]) & 0xff] ^ (c >> 8);
 	}
 	return ~c;
 }
@@ -3181,6 +3217,7 @@ monitor_start(const struct kernel_live *live, uint64_t slide, uint64_t sampler_f
 	monitor_args.live = (uint64_t)(uintptr_t)live;
 	monitor_args.slide = slide;
 	monitor_args.sampler = sampler_flag;
+	monitor_args.sysimg_crc = sysimg_crc_valid ? (uint64_t)sysimg_crc_value : 0;
 	monitor_args.ttbr0 = READ_SYSREG(TTBR0_EL1);
 	monitor_args.tcr = READ_SYSREG(TCR_EL1);
 	monitor_args.mair = READ_SYSREG(MAIR_EL1);
@@ -4254,7 +4291,7 @@ monitor_sampler(void)
 	uint64_t rows;
 
 	if (!sampler.found) {
-		unsigned d = monitor_cycle % 7;
+		unsigned d = monitor_cycle % 8;
 
 		n = put_str(buf, 0, sizeof(buf) - 1, "sampler: lsd not found  ");
 		if (d == 0) {
@@ -4276,7 +4313,7 @@ monitor_sampler(void)
 
 				buf[n++] = (c >= 32 && c < 127) ? c : '.';
 			}
-		} else {
+		} else if (d < 7) {
 			unsigned i = d - 3;
 
 			n = put_str(buf, n, sizeof(buf) - 1, "ptov");
@@ -4287,6 +4324,9 @@ monitor_sampler(void)
 			n = put_hex(buf, n, sizeof(buf) - 1, sampler.dbg_ptov[i][1]);
 			n = put_str(buf, n, sizeof(buf) - 1, " len=");
 			n = put_hex(buf, n, sizeof(buf) - 1, sampler.dbg_ptov[i][2]);
+		} else {
+			n = put_str(buf, n, sizeof(buf) - 1, "sysimg crc=");
+			n = put_hex(buf, n, sizeof(buf) - 1, monitor_args.sysimg_crc);
 		}
 		buf[n] = 0;
 		rows = (SCREEN.height > FB_Y0 + FB_CELL_H) ? (SCREEN.height - FB_Y0 - 8) / FB_CELL_H : 0;
@@ -4387,6 +4427,9 @@ sampler_to_text(char *d, uint32_t cap, uint32_t at)
 	unsigned n = at;
 
 	n = put_str(d, n, cap, "\n== monitor thread sampler ==\n");
+	n = put_str(d, n, cap, "sysimg crc ");
+	n = put_hex(d, n, cap, monitor_args.sysimg_crc);
+	n = put_str(d, n, cap, "\n");
 	if (!sampler.found) {
 		n = put_str(d, n, cap, "lsd: not found\n");
 		n = put_str(d, n, cap, "dbg head ");
@@ -5425,6 +5468,14 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			sysimg_status(done, want, started, first + want / bio->media->block_size,
 			    sysimg_bounce, dma_ms, copy_ms);
 		}
+		/*
+		 * The image as it now sits in RAM, so the bytes the kernel is about to use can be
+		 * compared with the file on the host: the read path (HS gear, DMA, the bounce
+		 * buffer) is the one thing that differs from QEMU's preloaded image.
+		 */
+		sysimg_crc_value = crc32_fast((const uint8_t *)(uintptr_t)dest, want);
+		sysimg_crc_valid = 1;
+		print("sysimg: crc32 %x over %d MB\n", (uint64_t)sysimg_crc_value, want >> 20);
 		{
 			const uint8_t *head = (const uint8_t *)(uintptr_t)dest;
 			int apfs = head[0x20] == 'N' && head[0x21] == 'X' && head[0x22] == 'S' &&
