@@ -1077,8 +1077,10 @@ static void stage_paint(uint32_t argb);
 static void stage_corner(uint32_t argb, int right, int bottom, unsigned px);
 static void fb_render_log(const char *log, uint64_t len, uint32_t fg);
 static void monitor_footer(uint64_t new_bytes, unsigned hidden);
+static void monitor_heartbeat(void);
 static void monitor_ustacks(uint64_t slide);
 static unsigned fb_reserve_rows;       /* rows the monitor keeps for its footer */
+static unsigned monitor_cycle;         /* passes of the monitor loop: the heartbeat */
 
 /*
  * The kernel's log, live. loader_return.c keeps every kprintf character
@@ -1344,10 +1346,12 @@ monitor_main(void)
 				save_log_slot(live, monitor_args.slide);
 			}
 			monitor_footer(log_new_bytes, log_hidden);
+			monitor_heartbeat();
 			if (monitor_args.ustacks_probe != 0) {
 				monitor_ustacks(monitor_args.slide);
 			}
 		}
+		monitor_cycle++;
 		started = READ_SYSREG(CNTVCT_EL0);
 		while (READ_SYSREG(CNTVCT_EL0) - started < 2 * freq) {
 		}
@@ -3137,7 +3141,7 @@ save_log_slot(const struct kernel_live *live, uint64_t slide)
 extern char __ImageBase;
 
 static void
-monitor_start(const struct kernel_live *live, uint64_t slide, uint64_t probe)
+monitor_start(const struct kernel_live *live, uint64_t slide, uint64_t probe, uint64_t save)
 {
 	uint8_t *base = (uint8_t *)(uintptr_t)&__ImageBase;
 	uint32_t pe_off, image_size;
@@ -3155,7 +3159,7 @@ monitor_start(const struct kernel_live *live, uint64_t slide, uint64_t probe)
 	monitor_args.mair = READ_SYSREG(MAIR_EL1);
 	monitor_args.sctlr = READ_SYSREG(SCTLR_EL1);
 	/* where the log can be kept: the free part of userdata (see LOG_SLOT_*) */
-	{
+	if (save) {
 		uint64_t first = 0, blocks = 0;
 		efi_block_io *bio = ufs_find_partition("userdata", &first, &blocks);
 
@@ -3927,6 +3931,14 @@ monitor_footer(uint64_t new_bytes, unsigned hidden)
 			buf[n++] = bad[i];
 		}
 	}
+	{
+		static const char hb[] = " hb ";
+
+		for (unsigned i = 0; hb[i] != 0; i++) {
+			buf[n++] = hb[i];
+		}
+		n += fb_u64(buf + n, monitor_cycle);
+	}
 	buf[n] = 0;
 
 	rows = (SCREEN.height > FB_Y0 + FB_CELL_H) ? (SCREEN.height - FB_Y0 - 8) / FB_CELL_H : 0;
@@ -3935,6 +3947,46 @@ monitor_footer(uint64_t new_bytes, unsigned hidden)
 	}
 	fb_row_clear(rows - 1);
 	fb_line((unsigned)(rows - 1), buf, 0xFF9A9A9Au);
+}
+
+/* A filled rectangle, clipped to the screen. */
+static void
+fb_fill_rect(uint64_t x, uint64_t y, uint64_t w, uint64_t h, uint32_t color)
+{
+	volatile uint32_t *p;
+	uint64_t words;
+
+	if (SCREEN.base == 0 || SCREEN.stride == 0 || SCREEN.height == 0) {
+		return;
+	}
+	p = (volatile uint32_t *)(uintptr_t)SCREEN.base;
+	words = SCREEN.stride / 4;
+	for (uint64_t yy = y; yy < y + h && yy < SCREEN.height; yy++) {
+		for (uint64_t xx = x; xx < x + w && xx < SCREEN.width && xx < words; xx++) {
+			p[yy * words + xx] = color;
+		}
+	}
+}
+
+/*
+ * The heartbeat: a square at the right end of the footer row, white on one pass and dark on the
+ * next, and the pass number ("hb N") in the footer. It answers what a frozen screen cannot: if
+ * the square keeps blinking while the log stands still, the kernel stopped logging; if the
+ * square stops too, this monitor did.
+ */
+static void
+monitor_heartbeat(void)
+{
+	uint64_t rows;
+	uint64_t x, y;
+
+	rows = (SCREEN.height > FB_Y0 + FB_CELL_H) ? (SCREEN.height - FB_Y0 - 8) / FB_CELL_H : 0;
+	if (rows == 0 || SCREEN.width < 2 * FB_X0 + 12) {
+		return;
+	}
+	x = SCREEN.width - FB_X0 - 12;
+	y = FB_Y0 + (rows - 1) * FB_CELL_H + 6;
+	fb_fill_rect(x, y, 12, 12, (monitor_cycle & 1) ? 0xFFFFFFFFu : 0xFF202020u);
 }
 
 /*
@@ -4779,6 +4831,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	int kret_hold = 0;
 	int showprev_mode = 0;         /* showprev=1: the saved log; showprev=ustacks: its ustacks lines */
 	int ustacks_probe = 0;         /* ustacks_probe=1: the monitor shows ustacks_*'s state too */
+	int monitor_save = 1;          /* monitor_save=0: the monitor keeps the log in RAM only */
 	/* "torch=N" (not 0) there too: the phone's flashlight is the kernel's (bsd/dev/redwood_torch.c) */
 	int torch_requested = 0;
 	/* "cam=5" there too: the phone's wide camera is iOS's (bsd/dev/redwood_camera.c) */
@@ -4816,6 +4869,10 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		    (c[9] == 0 || c[9] == ' ');
 		ustacks_probe |= starts_with(c, "ustacks_probe=1") && (c == pi.cmdline || c[-1] == ' ') &&
 		    (c[15] == 0 || c[15] == ' ');
+		if (starts_with(c, "monitor_save=0") && (c == pi.cmdline || c[-1] == ' ') &&
+		    (c[14] == 0 || c[14] == ' ')) {
+			monitor_save = 0;
+		}
 		block_probe_requested |= starts_with(c, "ufs_probe=1") && (c == pi.cmdline || c[-1] == ' ');
 		block_write_requested |= starts_with(c, "ufs_write=1") && (c == pi.cmdline || c[-1] == ' ') &&
 		    (c[11] == 0 || c[11] == ' ');
@@ -5421,7 +5478,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	 * never comes back (the system image boot is one).
 	 */
 	if (monitor_requested && kernel_mpidr == this_mpidr) {
-		monitor_start(kernel_live, slide, ustacks_probe);
+		monitor_start(kernel_live, slide, ustacks_probe, monitor_save);
 	}
 	print("jumping to %x\n", entry_va + slide);
 	stage_paint(STAGE_WHITE);
