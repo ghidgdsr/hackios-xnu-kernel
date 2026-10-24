@@ -26,14 +26,15 @@ core 0 (a core started by PSCI is left at EL2 and userland self-tests fail there
 
 ```
 LK -> boot.img (BootShim + UEFI firmware volume + XNUP payload)
-   -> UEFI (uefi-sheng, malachite platform)
+   -> UEFI (uefi-malachite, malachite platform)
    -> BootManagerLib/XnuLoader.c: start loader.efi from the XNUP payload
    -> xnuloader: load the kernel, build the device tree and boot_args, jump
    -> XNU: iOS 16.5 userland from the 2.4 GB system image on userdata (md0)
 ```
 
-The UEFI side lives in the [uefi-sheng](https://github.com/UniXNU/uefi-sheng)
-port (`Platforms/Xiaomi/malachitePkg`, `Silicon/MediaTek/MT6878Pkg`), on a fork.
+The UEFI side lives in [uefi-malachite](https://github.com/ghidgdsr/uefi-malachite),
+a fork of UniXNU's uefi-sheng (`Platforms/Xiaomi/malachitePkg`,
+`Silicon/MediaTek/MT6878Pkg`).
 The system image is written to the `userdata` partition; the loader reads it as
 `md0` (`sysimg=ufs`) and the payload ramdisk is `md1`.
 
