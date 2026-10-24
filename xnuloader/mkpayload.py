@@ -19,6 +19,7 @@ ap.add_argument('--rdres', default='', help='hex size of a root image already pl
 ap.add_argument('--checkpoint', default='', help='kernel checkpoint to stop at; 999 = loader self test')
 ap.add_argument('--hold', action='store_true', help='stay on the log screen after the run instead of resetting')
 ap.add_argument('--nokernel', action='store_true', help='stop after the payload is read; never enter the kernel')
+ap.add_argument('--ret', action='store_true', help='after the kernel path, return to the firmware (log mailbox)')
 ap.add_argument('items', nargs='*')
 args = ap.parse_args()
 
@@ -44,6 +45,8 @@ if args.hold:
     add('hold', b'1\0')
 if args.nokernel:
     add('nokernel', b'1\0')
+if args.ret:
+    add('ret', b'1\0')
 body += b'\0' * 24
 open(args.output, 'wb').write(struct.pack('<II', 0x50554E58, len(body)) + body)
 print(f'{args.output}: {len(body) + 8} bytes')

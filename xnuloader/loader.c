@@ -48,6 +48,7 @@ struct payload_entry { char name[16]; uint32_t size; uint32_t reserved; };
 #define LOG_MBOX_BASE       (PAYLOAD_BASE + PAYLOAD_MAX_SIZE - 0x80000ULL)
 #define LOG_MBOX_MAGIC      0x474F4C58u           /* "XLOG" */
 #define LOG_MBOX_SIZE       0x7F000u
+#define LOG_MBOX_FLAG_OFF   0x7F800u              /* u32: 1 = the log below is a fault log */
 
 /* ------------------------------------------------------------------------ */
 /* XNU structures (pexpert/pexpert/arm64/boot.h, mach-o/loader.h)           */
@@ -2481,6 +2482,8 @@ wdt_arm(void)
 
 extern char __ImageBase;
 
+static void publish_log(void);   /* defined with the payload below */
+
 static void EFIAPI
 exception_handler(int64_t type, uint64_t *ctx)
 {
@@ -2489,6 +2492,12 @@ exception_handler(int64_t type, uint64_t *ctx)
 	print("loader image base %x (elr offset %x)\n", (uint64_t)(uintptr_t)&__ImageBase,
 	    ctx[EXC_CTX_ELR] - (uint64_t)(uintptr_t)&__ImageBase);
 	flush_log();
+	/* Leave the log for the firmware of the next boot to print (DDR survives a PSCI
+	 * reset), with a flag the firmware checks before starting anything. The cache is
+	 * cleaned explicitly: dirty lines do not survive the reset on this hardware. */
+	publish_log();
+	*(volatile uint32_t *)(uintptr_t)(LOG_MBOX_BASE + LOG_MBOX_FLAG_OFF) = 1;
+	flush_dcache(LOG_MBOX_BASE, LOG_MBOX_BASE + 0x80000);
 	ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
 	for (;;) {
 	}
@@ -2526,6 +2535,7 @@ struct payload_info {
 	int usb_mode;
 	int hold;                       /* bring-up aid: stay on the log screen instead of resetting */
 	int nokernel;                   /* bring-up aid: stop after the payload is read, never enter the kernel */
+	int ret;                        /* bring-up aid: after the kernel path, return to the firmware */
 };
 
 static uint64_t
@@ -2582,6 +2592,8 @@ parse_payload(struct payload_info *pi, int verbose)
 			pi->hold = 1;                             /* bring-up: keep the log on screen, no reset */
 		} else if (str_eq(e->name, "nokernel")) {
 			pi->nokernel = 1;                         /* bring-up: stop after the payload is read */
+		} else if (str_eq(e->name, "ret")) {
+			pi->ret = 1;                              /* bring-up: return to the firmware after the run */
 		}
 		p += sizeof(*e) + ((e->size + 15) & ~15u);
 	}
@@ -2659,6 +2671,10 @@ static char last_result[64] = "idle";
 #define STAGE_CYAN     0xFF00FFFFu      /* payload read */
 #define STAGE_MAGENTA  0xFFFF00FFu      /* entering the kernel (self test) */
 #define STAGE_GREEN    0xFF00FF00u      /* run_kernel returned */
+#define STAGE_YELLOW   0xFFFFFF00u      /* physical window claimed */
+#define STAGE_LIME     0xFF80FF00u      /* kernel segments copied */
+#define STAGE_ORANGE   0xFFFF8000u      /* kernel and ramdisk loaded */
+#define STAGE_WHITE    0xFFFFFFFFu      /* about to jump to the kernel / return stub */
 
 static void
 stage_paint(uint32_t argb)
@@ -2837,6 +2853,19 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	if (!choose_window(&pi)) {
 		return 0;
 	}
+	stage_paint(STAGE_YELLOW);
+
+#ifdef MALACHITE_STAGES
+	/* Probe the claimed window before trusting it with the kernel: a fault here
+	 * means the firmware mapped the descriptive region but not the memory. */
+	{
+		volatile uint64_t *probe = (volatile uint64_t *)(uintptr_t)(win_base + 0x1000000);
+		*probe = 0xA5A5A5A5A5A5A5A5ULL;
+		if (*probe == 0xA5A5A5A5A5A5A5A5ULL) {
+			stage_paint(STAGE_LIME);
+		}
+	}
+#endif
 
 	uint64_t phys_base = win_base;
 	uint64_t slide = phys_base - KERNEL_VIRT_BASE; /* pa = va + slide */
@@ -2890,6 +2919,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		memcpy((void *)(sg->vmaddr + slide), kernel + sg->fileoff, sg->filesize);
 	}
 	print("kernel loaded at pa %x..%x\n", kern_lo, kern_hi);
+	stage_paint(STAGE_ORANGE);
 	if (rd_resident) {
 		print("resident ramdisk at pa %x size %x\n", rd_pa, rd_size);
 	} else if (rd_size != 0) {
@@ -3328,6 +3358,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		print("the kernel will run on core %x (this is core %x)\n", kernel_mpidr, this_mpidr);
 	}
 	print("jumping to %x\n", entry_va + slide);
+	stage_paint(STAGE_WHITE);
 	flush_log();
 	/* From here on the kernel feeds the watchdog (boot-arg hv_wdt_pet, see loader_return.c in XNU). */
 	wdt_set_ms(60000);
@@ -3354,7 +3385,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			}
 		}
 		uint64_t sp_now = (uint64_t)(uintptr_t)__builtin_frame_address(0);
-		clean_dcache(sp_now - 0x2000, sp_now + 0x2000);
+		/* Stay below the top of the UEFI stack: one page past it may be unmapped
+		 * (malachite's RAM hole), and a clean of an unmapped line is a fault. */
+		clean_dcache(sp_now - 0x2000, sp_now + 0x200);
 		flush_dcache(phys_base, top);
 		if (checkpoint == CHECKPOINT_SELFTEST) {
 			/* Do not enter the kernel at all: exercise only the return path. */
@@ -3982,6 +4015,20 @@ ramfb_phone_screen(void)
 	SCREEN.stride = PHONE_WIDTH * 4;
 }
 
+/* Hand this loader's log to the firmware (see XnuLoader.c): the EFI console has no
+ * output device on the malachite port yet, the firmware's DEBUG console does. */
+static void
+publish_log(void)
+{
+	volatile uint32_t *mbox = (volatile uint32_t *)(uintptr_t)LOG_MBOX_BASE;
+	uint32_t n = log_len < LOG_MBOX_SIZE ? log_len : LOG_MBOX_SIZE;
+
+	mbox[0] = LOG_MBOX_MAGIC;
+	mbox[1] = n;
+	memcpy((void *)(uintptr_t)(LOG_MBOX_BASE + 8), log_buf, n);
+	((volatile char *)(uintptr_t)(LOG_MBOX_BASE + 8))[n] = 0;
+}
+
 efi_status EFIAPI
 efi_main(efi_handle image, efi_system_table *st)
 {
@@ -4003,6 +4050,10 @@ efi_main(efi_handle image, efi_system_table *st)
 	BS = st->bs;
 	IMAGE = image;
 
+#ifdef MALACHITE_QUIET
+	/* Bring-up: the EFI console's output path faults on this port; log only. */
+	screen_quiet = 1;
+#endif
 	BS->set_watchdog_timer(0, 0, 0, NULL);
 	print("== XNULOADER v3 ==\n");
 	print("CurrentEL=%x MIDR=%x MMFR0=%x CNTFRQ=%d image=%x\n", READ_SYSREG(CurrentEL) >> 2, READ_SYSREG(MIDR_EL1),
@@ -4056,12 +4107,7 @@ efi_main(efi_handle image, efi_system_table *st)
 				px[i] = 0xFF00FF00u;
 			}
 		}
-		volatile uint32_t *mbox = (volatile uint32_t *)(uintptr_t)LOG_MBOX_BASE;
-		uint32_t n = log_len < LOG_MBOX_SIZE ? log_len : LOG_MBOX_SIZE;
-		mbox[0] = LOG_MBOX_MAGIC;
-		mbox[1] = n;
-		memcpy((void *)(uintptr_t)(LOG_MBOX_BASE + 8), log_buf, n);
-		((volatile char *)(uintptr_t)(LOG_MBOX_BASE + 8))[n] = 0;
+		publish_log();
 		return 0;
 	}
 	if (have_payload && pi.usb_mode && usb_start()) {
@@ -4074,6 +4120,11 @@ efi_main(efi_handle image, efi_system_table *st)
 		stage_paint(STAGE_MAGENTA);
 		run_kernel(0, 0);
 		stage_paint(STAGE_GREEN);
+		if (pi.ret) {
+			/* Bring-up: give the firmware the log to print over its DEBUG console. */
+			publish_log();
+			return 0;
+		}
 		if (pi.hold) {
 			/* A device with no USB link yet: leave the log where it can be photographed. */
 			print("holding (payload hold=1): power-cycle to leave\n");
