@@ -32,6 +32,25 @@ typedef struct efi_text_output {
 	efi_status (EFIAPI *output_string)(struct efi_text_output *self, const char16 *str);
 } efi_text_output;
 
+/*
+ * EFI_SIMPLE_TEXT_INPUT_PROTOCOL: what the firmware's keypad produces. On malachite one key
+ * (volume up) is visible to the firmware: a short press is SCAN_UP, a press held past 700 ms
+ * is Enter (see SiliciumPkg/Drivers/KeypadDxe and malachitePkg KeypadDeviceLib).
+ */
+#define SCAN_UP 0x0001
+#define SCAN_DOWN 0x0002
+typedef struct {
+	uint16_t scan_code;
+	char16 unicode_char;
+} efi_input_key;
+struct efi_simple_text_input;
+typedef struct efi_simple_text_input {
+	efi_status (EFIAPI *reset)(struct efi_simple_text_input *self, uint8_t extended);
+	efi_status (EFIAPI *read_key_stroke)(struct efi_simple_text_input *self, efi_input_key *key);
+	void *wait_for_key;
+} efi_simple_text_input;
+#define EFI_SIMPLE_TEXT_INPUT_GUID { 0x387477c1, 0x69c7, 0x11d2, { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b } }
+
 enum { EfiLoaderData = 2, EfiConventionalMemory = 7 };
 enum { AllocateAnyPages = 0, AllocateMaxAddress = 1, AllocateAddress = 2 };
 enum { ByProtocol = 2 };

@@ -11,6 +11,7 @@
  */
 #include "efi.h"
 #include "identity.h"         /* who iOS shall think we are: from the iPhone's own device tree (mkidentity.py) */
+#include "font5x12.h"         /* the framebuffer console's font, for logs the EFI console cannot show */
 
 /* ------------------------------------------------------------------------ */
 /* Fixed conventions shared with the boot shim, the packer and the kernel   */
@@ -522,6 +523,17 @@ dt_end(struct dt_writer *w)
 /* ------------------------------------------------------------------------ */
 /* Platform description                                                     */
 
+/*
+ * The phone has no UART, and the kernel's serial driver is the only way its kprintf reaches
+ * this loader's log (pexpert/arm/pe_kprintf.c: serial_putc_crlf -> loader_log_putc). So the
+ * device tree points uart0 at a page in the loader's reserved payload area instead: the kernel
+ * maps it uncached and treats it as a PL011, and since the page is zeroed and nothing writes
+ * its FR word, the transmit-ready bit (FR & 0x20) always reads clear. The characters it
+ * "sends" land at DRAM the kernel does not otherwise use. The page is past the XNUP payload
+ * (about 20 MB) and well below the panic log and mailbox at the end of the reserved area.
+ */
+#define MALACHITE_FAKE_UART (PAYLOAD_BASE + 0x03000000ULL)
+
 struct platform {
 	const char *name;
 	uint64_t io_base, io_size;       /* one window covering the SoC peripherals */
@@ -567,7 +579,7 @@ static const struct platform platform_malachite = {
 	 * The peripheral window follows redwood's: MTK's GIC (0x0C000000), pinctrl (0x10005000)
 	 * and watchdog (0x1C00A000) all fall inside 0x00400000..0x40000000. */
 	.name = "malachite", .io_base = 0x00400000, .io_size = 0x3FC00000,
-	.gic_dist = 0x0C000000, .gic_redist = 0x0C040000, .uart = 0, .log_other_cpu = 1,
+	.gic_dist = 0x0C000000, .gic_redist = 0x0C040000, .uart = MALACHITE_FAKE_UART, .log_other_cpu = 1,
 	.cores = 8, .core_shift = 8,       /* cpu@N reg = 0xN00: MPIDR's second affinity field */
 	.small_cores = 0x0f,               /* cpu0-3: Cortex-A55 (capacity-dmips-mhz 267), cpu4-7: A78 */
 	.fb_base = 0xFD91F000,             /* LK's scanout buffer, top of the first 4 GiB; it can move
@@ -789,6 +801,7 @@ static struct {
 } other_cpu_start __attribute__((aligned(64)));
 volatile uint64_t other_cpu_stage __attribute__((aligned(64)));  /* 1: that core has reached other_cpu_entry */
 volatile uint64_t other_cpu_done __attribute__((aligned(64)));   /* 1: the kernel is back (other_cpu_return_stub) */
+uint64_t other_cpu_el __attribute__((aligned(64)));              /* CurrentEL that core started at */
 uint64_t psci_by_hvc __attribute__((aligned(64)));
 void other_cpu_entry(void);
 void other_cpu_return_stub(void);
@@ -797,8 +810,33 @@ __asm__ (
         ".text\n"
         ".balign 64\n"
         ".globl other_cpu_entry\n"
-        "other_cpu_entry:\n"                    /* x0 = &other_cpu_start; MMU and caches are off */
+        "other_cpu_entry:\n"                    /* MMU and caches are off; the entry and its arguments are in other_cpu_start */
         "  msr daifset, #0xf\n"
+        "  mrs x12, CurrentEL\n"                 /* remember which EL the firmware started this core at */
+        "  adrp x13, other_cpu_el\n"
+        "  add  x13, x13, :lo12:other_cpu_el\n"
+        "  str x12, [x13]\n"
+        /*
+         * PSCI CPU_ON can enter a secondary core at EL2 on this SoC. This code
+         * (and the kernel's early boot) is written for EL1, where the boot core
+         * runs under the firmware; on EL2 every cpacr_el1/sctlr_el1 access traps
+         * to EL2 and lands in other_cpu_fault (reason 1, no log). Set up a
+         * plain EL1&0 regime and drop to EL1 first.
+         */
+        "  cmp x12, #0x8\n"
+        "  b.ne 1f\n"
+        "  mov x11, #0x80000000\n"               /* HCR_EL2: RW=1 (AArch64 EL1), no traps */
+        "  msr hcr_el2, x11\n"
+        "  msr cptr_el2, xzr\n"                  /* no FP/SIMD traps from EL1 */
+        "  isb\n"
+        "  adrp x9, other_cpu_entry_el1\n"
+        "  add  x9, x9, :lo12:other_cpu_entry_el1\n"
+        "  msr elr_el2, x9\n"
+        "  mov x9, #0x3c5\n"                     /* SPSR: EL1h, DAIF masked */
+        "  msr spsr_el2, x9\n"
+        "  eret\n"
+        "1:\n"
+        "other_cpu_entry_el1:\n"
         /* until the kernel has vectors of its own, an exception must not go nowhere */
         "  adrp x9, other_cpu_vectors\n"
         "  add  x9, x9, :lo12:other_cpu_vectors\n"
@@ -819,8 +857,12 @@ __asm__ (
         "  add  x9, x9, :lo12:other_cpu_stage\n"
         "  mov x10, #1\n"
         "  str x10, [x9]\n"
-        "  ldp x9, x10, [x0]\n"
-        "  mov x0, x10\n"
+        /* the kernel entry and its boot_args, from this loader's own memory: the
+         * firmware's context register is not relied on (it read back as zero) */
+        "  adrp x10, other_cpu_start\n"
+        "  add  x10, x10, :lo12:other_cpu_start\n"
+        "  ldp x9, x11, [x10]\n"
+        "  mov x0, x11\n"
         "  br x9\n"
         "other_cpu_fault:\n"                    /* as an early exception in the kernel: reason 1 */
         "  mrs x3, esr_el1\n"
@@ -877,6 +919,58 @@ __asm__ (
         "  b 1b\n"
         "2: hvc #0\n"
         "  b 1b\n"
+        );
+
+/*
+ * The log monitor: a core the kernel never learns about (it runs with cpus=1)
+ * adopts the UEFI page tables and cache settings handed to it in monitor_args
+ * -- so its reads of the kernel's log are cache-coherent with the kernel's
+ * writes -- and then sits in monitor_main drawing that log.
+ */
+__asm__ (
+        ".text\n"
+        ".balign 64\n"
+        ".globl monitor_entry\n"
+        "monitor_entry:\n"                      /* caches and MMU off */
+        "  msr daifset, #0xf\n"
+        "  mrs x9, CurrentEL\n"
+        "  cmp x9, #0x8\n"
+        "  b.ne 1f\n"
+        "  mov x11, #0x80000000\n"              /* HCR_EL2: RW=1, no traps */
+        "  msr hcr_el2, x11\n"
+        "  msr cptr_el2, xzr\n"
+        "  isb\n"
+        "  adrp x9, monitor_entry_el1\n"
+        "  add  x9, x9, :lo12:monitor_entry_el1\n"
+        "  msr elr_el2, x9\n"
+        "  mov x9, #0x3c5\n"                    /* SPSR: EL1h, DAIF masked */
+        "  msr spsr_el2, x9\n"
+        "  eret\n"
+        "1:\n"
+        "monitor_entry_el1:\n"
+        "  adrp x10, monitor_args\n"
+        "  add  x10, x10, :lo12:monitor_args\n"
+        "  ldr x9, [x10, #16]\n"                /* ttbr0 */
+        "  msr ttbr0_el1, x9\n"
+        "  ldr x9, [x10, #24]\n"                /* tcr */
+        "  msr tcr_el1, x9\n"
+        "  ldr x9, [x10, #32]\n"                /* mair */
+        "  msr mair_el1, x9\n"
+        "  dsb sy\n"
+        "  isb\n"
+        "  tlbi vmalle1\n"
+        "  dsb sy\n"
+        "  isb\n"
+        "  ldr x9, [x10, #40]\n"                /* sctlr: UEFI's, MMU and caches on */
+        "  msr sctlr_el1, x9\n"
+        "  isb\n"
+        "  adrp x9, monitor_stack\n"
+        "  add  x9, x9, :lo12:monitor_stack\n"
+        "  add  x9, x9, #16384\n"
+        "  mov  sp, x9\n"
+        "  bl monitor_main\n"
+        "2: wfi\n"
+        "  b 2b\n"
         );
 
 static uint64_t smc_call(uint64_t id, uint64_t a1, uint64_t a2, uint64_t *r1, uint64_t *r2);
@@ -979,6 +1073,286 @@ static int wdt_armed;
 static const struct kernel_live *running_live;
 static uint64_t running_slide;
 static void usb_poll_command(void);
+static void stage_paint(uint32_t argb);
+static void stage_corner(uint32_t argb, int right, int bottom, unsigned px);
+static void fb_render_log(const char *log, uint64_t len, uint32_t fg);
+static void monitor_footer(uint64_t new_bytes, unsigned hidden);
+static void monitor_ustacks(uint64_t slide);
+static unsigned fb_reserve_rows;       /* rows the monitor keeps for its footer */
+
+/*
+ * The kernel's log, live. loader_return.c keeps every kprintf character
+ * (pexpert/arm/pe_kprintf.c) and everything user space writes to /dev/console
+ * (bsd/dev/arm/km.c) in loader_log -- a linear first part and a ring -- and
+ * loader_live publishes where it and its state are. Reading that from this
+ * core and drawing it needs no return and no cooperation from the kernel.
+ *
+ * The screen shows whole lines and leaves the persona noise out: this port has
+ * no persona subsystem, the kernel answers ESRCH to everything that asks about
+ * one, and launchd and usermanagerd ask on every spawn and every sync. The
+ * full log is still in loader_log; only the panel would otherwise be filled
+ * with "no such process" and lose the line that says where the boot really is.
+ */
+#define LOG_TAIL_SIZE 32768u
+
+static char log_tail[LOG_TAIL_SIZE];
+static char log_clean[LOG_TAIL_SIZE];  /* the last 32 KB of lines worth showing, as a ring */
+static char log_line[512];
+static uint32_t log_clean_at, log_clean_len;
+static unsigned log_hidden;            /* noise lines left out, last pass */
+/* A sign of life that survives the log wrapping: characters the monitor has seen arrive. */
+static uint64_t log_new_bytes;
+static uint32_t log_last_pos;
+static int log_last_wrapped = -1;      /* -1: no look yet; else whether the ring had wrapped */
+
+static int
+log_find(const char *s, const char *needle)
+{
+	for (; *s != 0; s++) {
+		const char *a = s, *b = needle;
+
+		while (*b != 0 && *a == *b) {
+			a++;
+			b++;
+		}
+		if (*b == 0) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static int
+log_noise(const char *line)
+{
+	static const char *const patterns[] = {
+		"kpersona_find_by_type() failed",
+		"Unable to find persona with type",
+		"persona info for pid",
+		"look up persona for pid",
+		"info for kernel persona",
+		"persona array OK:",
+		"denied attempt to escape CPU monitor",
+	};
+
+	for (unsigned i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++) {
+		if (log_find(line, patterns[i])) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static void
+log_clean_putc(char c)
+{
+	log_clean[log_clean_at] = c;
+	if (++log_clean_at == LOG_TAIL_SIZE) {
+		log_clean_at = 0;
+	}
+	if (log_clean_len < LOG_TAIL_SIZE) {
+		log_clean_len++;
+	}
+}
+
+static void
+render_kernel_log(const struct kernel_live *live, uint64_t slide)
+{
+	const char *log = (const char *)(uintptr_t)(live->log + slide);
+	uint32_t len = *(volatile uint32_t *)(live->log_len + slide);
+	uint32_t ring_at = *(volatile uint32_t *)(live->log_ring_at + slide);
+	uint32_t head = (uint32_t)live->log_head, ring = (uint32_t)live->log_ring;
+	int wrapped = *(volatile uint8_t *)(live->log_wrapped + slide);
+	const char *seg[3];
+	uint32_t segn[3];
+	int ns = 0;
+	uint32_t line_len = 0, show, start, first;
+	unsigned hidden = 0;
+
+	if (ring_at > ring) {
+		ring_at = ring;
+	}
+	if (!wrapped) {
+		if (len > head + ring) {
+			len = head + ring;
+		}
+		seg[0] = log;
+		segn[0] = len;
+		ns = 1;
+	} else {
+		seg[0] = log;
+		segn[0] = head;
+		seg[1] = log + head + ring_at;
+		segn[1] = ring - ring_at;
+		seg[2] = log + head;
+		segn[2] = ring_at;
+		ns = 3;
+	}
+	/*
+	 * How much has arrived since the last look. The log's length stops moving once its ring
+	 * wraps, so follow the ring pointer instead; a delta may then be short only if a whole
+	 * ring went by between two looks (a megabyte in two seconds), which does not happen.
+	 */
+	if (!wrapped) {
+		if (log_last_wrapped == 0 && len >= log_last_pos) {
+			log_new_bytes += len - log_last_pos;
+		}
+		log_last_pos = len;
+		log_last_wrapped = 0;
+	} else if (log_last_wrapped == 1) {
+		log_new_bytes += (ring_at + ring - log_last_pos) % ring;
+		log_last_pos = ring_at;
+	} else {
+		log_last_pos = ring_at;
+		log_last_wrapped = 1;
+	}
+	/* whole lines, oldest to newest: leave the noise out, keep the last 32 KB */
+	log_clean_at = 0;
+	log_clean_len = 0;
+	for (int i = 0; i < ns; i++) {
+		for (uint32_t j = 0; j < segn[i]; j++) {
+			char c = seg[i][j];
+
+			if (c == '\r') {
+				continue;
+			}
+			if (c != '\n') {
+				if (line_len < sizeof(log_line) - 1) {
+					log_line[line_len++] = c;
+				}
+				continue;
+			}
+			log_line[line_len] = 0;
+			if (line_len != 0 && log_noise(log_line)) {
+				hidden++;
+			} else {
+				for (uint32_t k = 0; k < line_len; k++) {
+					log_clean_putc(log_line[k]);
+				}
+				log_clean_putc('\n');
+			}
+			line_len = 0;
+		}
+	}
+	/* a line still being written has no '\n' yet: it is the newest text there is */
+	if (line_len != 0) {
+		log_line[line_len] = 0;
+		if (!log_noise(log_line)) {
+			for (uint32_t k = 0; k < line_len; k++) {
+				log_clean_putc(log_line[k]);
+			}
+		}
+	}
+	log_hidden = hidden;
+
+	show = log_clean_len;
+	if (show == 0) {
+		stage_paint(0xFF000000u);
+		return;
+	}
+	start = (log_clean_at + LOG_TAIL_SIZE - show) % LOG_TAIL_SIZE;
+	first = LOG_TAIL_SIZE - start;
+	if (first > show) {
+		first = show;
+	}
+	memcpy(log_tail, log_clean + start, first);
+	memcpy(log_tail + first, log_clean, show - first);
+	fb_render_log(log_tail, show, 0xFF00FF00u);
+}
+
+/* ------------------------------------------------------------------------ */
+/* A log monitor on a core the kernel does not use                         */
+/*                                                                          */
+/* The kernel runs on the boot core with cpus=1; this loader starts another */
+/* core with PSCI and leaves it drawing the kernel's log from loader_log.   */
+/* It is given the UEFI regime (page tables, cache settings) so that what   */
+/* it reads is cache-coherent with the kernel's writes, and it never asks   */
+/* the kernel for anything -- no return, no heartbeat.                      */
+
+#define MONITOR_MPIDR 0x700ULL                 /* a big core; the kernel is told it has one CPU */
+
+struct monitor_args {
+	uint64_t live, slide;                  /* where loader_live is, and the kernel's slide */
+	uint64_t ttbr0, tcr, mair, sctlr;      /* the UEFI regime, for that core to adopt */
+	/* appended below what monitor_entry reads by offset: where the log can be kept */
+	uint64_t slot_bio;                     /* userdata's Block I/O, 0 when there is none */
+	uint64_t slot_first, slot_blocks;      /* its first LBA and size, in media blocks */
+	uint64_t slot_block_size;
+	uint64_t ustacks_probe;                /* ustacks_probe=1: show the kernel's sampler globals */
+};
+
+/*
+ * A copy of the log that outlives the run, in the free part of userdata.
+ *
+ * The firmware on this phone has no USB stack, so the loader cannot hand the log to the host
+ * while the kernel hangs. What it can do is put it on the storage it drives itself: two slots
+ * in userdata, four gigabytes in, well past the 2.4 GB system image at the partition's start.
+ * The monitor core rewrites the newest one every few seconds; a "showprev=1" run reads the
+ * newest valid one back and draws it (and the region can be read with mtkclient as well).
+ *
+ * A slot is one block of header and then the last bytes of loader_log in order. The two slots
+ * are written alternately, so a write cut short by a reset leaves the other one intact; the
+ * header carries a sequence number and a CRC of the text, which is how the reader picks.
+ */
+#define LOG_SLOT_OFFSET     (0x100000000ULL)    /* 4 GiB into userdata */
+#define LOG_SLOT_SIZE       (2u << 20)          /* per slot */
+#define LOG_SLOT_HEADER     4096u               /* text starts at this offset (one block) */
+#define LOG_SLOT_MAGIC      0x5653474F4C554E58ULL /* "XNULOGSV" */
+
+struct log_slot_header {
+	uint64_t magic;
+	uint32_t version;
+	uint32_t length;                        /* bytes of text */
+	uint64_t total;                         /* loader_log bytes at the time */
+	uint64_t seq;
+	uint64_t uptime_ms;
+	uint32_t crc;                           /* of the text */
+	uint32_t reserved;
+};
+
+static uint8_t log_slot_buf[LOG_SLOT_SIZE] __attribute__((aligned(0x1000)));
+static uint64_t log_slot_seq;                   /* the last sequence number written */
+static int log_slot_state;                      /* 0 not tried, 1 written, else the error's low bits */
+static uint32_t log_slot_total;                 /* loader_log bytes at the last write */
+static void save_log_slot(const struct kernel_live *live, uint64_t slide);
+
+struct monitor_args monitor_args;
+uint8_t monitor_stack[16384] __attribute__((aligned(16)));
+void monitor_entry(void);
+void monitor_main(void);
+
+void
+monitor_main(void)
+{
+	const struct kernel_live *live = (const struct kernel_live *)(uintptr_t)monitor_args.live;
+	uint64_t freq = READ_SYSREG(CNTFRQ_EL0);
+	uint64_t last_save = 0;
+
+	for (;;) {
+		uint64_t started, now;
+
+		if (live != NULL) {
+			now = READ_SYSREG(CNTVCT_EL0);
+			fb_reserve_rows = monitor_args.ustacks_probe != 0 ? 2 : 1;
+			render_kernel_log(live, monitor_args.slide);
+			/*
+			 * The log is put on the storage as it stands every ten seconds: the last slot
+			 * written before a hang is what a "showprev=1" run (or mtkclient) gets back.
+			 */
+			if (monitor_args.slot_bio != 0 && now - last_save >= 10 * freq) {
+				last_save = now;
+				save_log_slot(live, monitor_args.slide);
+			}
+			monitor_footer(log_new_bytes, log_hidden);
+			if (monitor_args.ustacks_probe != 0) {
+				monitor_ustacks(monitor_args.slide);
+			}
+		}
+		started = READ_SYSREG(CNTVCT_EL0);
+		while (READ_SYSREG(CNTVCT_EL0) - started < 2 * freq) {
+		}
+	}
+}
 
 static uint64_t
 seconds_since(uint64_t then)
@@ -1273,11 +1647,167 @@ ufs_crc32(const uint8_t *p, uint64_t n)
  * partitions. Whatever firmware is on the phone, the bytes read are the bytes on the flash only if
  * both come out right -- the one check here that does not depend on having the same images.
  */
+/*
+ * Android's dynamic partitions live inside "super" as liblp extents. Read the
+ * metadata (read only), print each logical partition, and find the largest
+ * unallocated hole: that is the one place a volume of this port's own can go
+ * without moving any of Android's partitions.
+ *
+ * Layout (liblp/metadata_format.h): geometry at offset 4096, magic 0x616c4467,
+ * metadata_max_size at 40, metadata_slot_count at 44; a slot's metadata is at
+ * 3*4096 + slot*max_size. Header magic 0x414c5030, header_size at 8,
+ * tables_size at 44; the table descriptors start at 80 (partitions), 92
+ * (extents), 104 (groups), 116 (block devices), 12 bytes each. Partition
+ * entry: name[36], attributes, first_extent_index, num_extents. Extent entry:
+ * num_sectors u64, target_type u32, target_data u64, target_source u32; the
+ * LINEAR extents of source 0 are the sectors used inside super.
+ */
+static void
+ufs_analyze_super(efi_block_io *bio, uint64_t first_lba, uint64_t last_lba)
+{
+	uint64_t bs = bio->media->block_size;
+	uint64_t sectors = (last_lba - first_lba + 1) * bs / 512;
+	uint64_t head = (8192 + bs - 1) / bs * bs;   /* through the geometry at 4096 */
+	const uint8_t *geometry;
+	uint32_t max_size, slots;
+	uint64_t want, read;
+
+	if (bs == 0 || bs > sizeof(ufs_buffer) || head > sizeof(ufs_buffer) ||
+	    EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, first_lba, head, ufs_buffer))) {
+		print("ufs: super: its start could not be read\n");
+		return;
+	}
+	geometry = ufs_buffer + 4096;
+	if (*(const uint32_t *)geometry != 0x616c4467) {
+		print("ufs: super: no liblp geometry (magic %x)\n", (uint64_t)*(const uint32_t *)geometry);
+		return;
+	}
+	max_size = *(const uint32_t *)(geometry + 40);
+	slots = *(const uint32_t *)(geometry + 44);
+	if (max_size == 0 || slots == 0 || slots > 4) {
+		print("ufs: super: max_size %x slots %d\n", (uint64_t)max_size, (uint64_t)slots);
+		return;
+	}
+	want = 3 * 4096 + (uint64_t)slots * max_size;
+	read = (want + bs - 1) / bs * bs;
+	if (read > sizeof(ufs_buffer) ||
+	    EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, first_lba, read, ufs_buffer))) {
+		print("ufs: super: %d KB of metadata could not be read\n", want >> 10);
+		return;
+	}
+
+	for (uint32_t slot = 0; slot < slots; slot++) {
+		const uint8_t *hdr = ufs_buffer + 3 * 4096 + (uint64_t)slot * max_size;
+		const uint8_t *tables;
+		uint32_t header_size, tables_size, po, pn, pe, eo, en, ee;
+		static struct { uint64_t start, len; } ex[96];
+		unsigned nex = 0, i, j;
+		uint64_t cursor = 0, covered = 0, best = 0, best_start = 0, best_end = 0;
+
+		if (*(const uint32_t *)hdr != 0x414c5030) {
+			print("ufs: super slot %d: no metadata header\n", (uint64_t)slot);
+			continue;
+		}
+		header_size = *(const uint32_t *)(hdr + 8);
+		tables_size = *(const uint32_t *)(hdr + 44);
+		if (header_size < 128 || header_size + (uint64_t)tables_size > max_size) {
+			print("ufs: super slot %d: header %x tables %x max %x\n", (uint64_t)slot,
+			    (uint64_t)header_size, (uint64_t)tables_size, (uint64_t)max_size);
+			continue;
+		}
+		tables = hdr + header_size;
+		po = *(const uint32_t *)(hdr + 80);
+		pn = *(const uint32_t *)(hdr + 84);
+		pe = *(const uint32_t *)(hdr + 88);
+		eo = *(const uint32_t *)(hdr + 92);
+		en = *(const uint32_t *)(hdr + 96);
+		ee = *(const uint32_t *)(hdr + 100);
+		if (pe < 52 || ee < 24 || (uint64_t)po + (uint64_t)pn * pe > tables_size ||
+		    (uint64_t)eo + (uint64_t)en * ee > tables_size) {
+			print("ufs: super slot %d: tables p %x/%x/%x e %x/%x/%x, size %x\n", (uint64_t)slot,
+			    (uint64_t)po, (uint64_t)pn, (uint64_t)pe, (uint64_t)eo, (uint64_t)en, (uint64_t)ee,
+			    (uint64_t)tables_size);
+			continue;
+		}
+
+		for (i = 0; i < pn; i++) {
+			const uint8_t *p = tables + po + (uint64_t)i * pe;
+			char name[37];
+			uint64_t mb = 0;
+			uint32_t fe = *(const uint32_t *)(p + 40);
+			uint32_t np = *(const uint32_t *)(p + 44);
+
+			memcpy(name, p, 36);
+			name[36] = 0;
+			for (j = 0; j < np && (uint64_t)(fe + j) < en; j++) {
+				const uint8_t *e = tables + eo + (uint64_t)(fe + j) * ee;
+				uint64_t ns = *(const uint64_t *)(e + 0);
+				uint32_t tt = *(const uint32_t *)(e + 8);
+				uint64_t td = *(const uint64_t *)(e + 12);
+				uint32_t ts = *(const uint32_t *)(e + 20);
+
+				mb += ns;
+				if (tt == 0 && ts == 0 && nex < 96) {
+					ex[nex].start = td;
+					ex[nex].len = ns;
+					nex++;
+				}
+			}
+			if (slot == 0) {
+				print("ufs: super p%d %s: %d MB\n", (uint64_t)i, name, (mb * 512) >> 20);
+			}
+		}
+
+		for (i = 1; i < nex; i++) {
+			for (j = i; j > 0 && ex[j].start < ex[j - 1].start; j--) {
+				typeof(ex[0]) t = ex[j];
+
+				ex[j] = ex[j - 1];
+				ex[j - 1] = t;
+			}
+		}
+		for (i = 0; i < nex; i++) {
+			uint64_t s = ex[i].start, l = ex[i].len;
+
+			if (s > cursor) {
+				uint64_t bytes = (s - cursor) * 512;
+
+				if (bytes > best) {
+					best = bytes;
+					best_start = cursor;
+					best_end = s - 1;
+				}
+			}
+			if (s + l > cursor) {
+				covered += s + l - cursor;
+				cursor = s + l;
+			}
+		}
+		if (sectors > cursor) {
+			uint64_t bytes = (sectors - cursor) * 512;
+
+			if (bytes > best) {
+				best = bytes;
+				best_start = cursor;
+				best_end = sectors - 1;
+			}
+		}
+		if (covered > sectors) {
+			covered = sectors;
+		}
+		print("ufs: super slot %d: %d parts, %d MB used, %d MB free, largest lba %x..%x (%d MB)\n",
+		    (uint64_t)slot, (uint64_t)pn, (covered * 512) >> 20,
+		    ((sectors - covered) * 512) >> 20, best_start, best_end, best >> 20);
+	}
+}
+
 static void
 ufs_check_gpt(efi_block_io *bio, uint64_t unit)
 {
 	uint64_t bs = bio->media->block_size, entries_lba, count, size, bytes, read;
+	uint64_t super_first = 0, super_last = 0;
 	uint32_t header_size, header_crc, entries_crc, got_header, got_entries;
+	int have_super = 0;
 	uint8_t header[512];
 
 	if (bs < 512 || bs > sizeof(ufs_buffer) ||
@@ -1318,6 +1848,200 @@ ufs_check_gpt(efi_block_io *bio, uint64_t unit)
 	print("ufs: unit %d: GPT header crc %s (%x), table of %d entries crc %s (%x)\n", unit,
 	    got_header == header_crc ? "right" : "WRONG", (uint64_t)got_header, count,
 	    got_entries == entries_crc ? "right" : "WRONG", (uint64_t)got_entries);
+
+	/*
+	 * The partitions themselves, in table order: GPT entry is 128 bytes,
+	 * the type GUID is all zero for an unused entry, and the name is
+	 * UTF-16LE at offset 56 (36 code units).
+	 */
+	if (size < 128) {
+		print("ufs: unit %d: entry size %d, not listed\n", unit, (uint64_t)size);
+		return;
+	}
+
+	{
+		/*
+		 * The list itself has to fit the panel: two partitions per line,
+		 * index, name and size, and the large ones once more with their
+		 * exact LBA range. A gap between two used partitions is what a
+		 * volume of the port's own could occupy without moving anything.
+		 */
+		static struct {
+			uint64_t first, last;
+			uint32_t index;
+			char name[25];
+		} parts[128];
+		uint32_t n = 0;
+
+		for (uint32_t e = 0; e < count && n < 128; e++) {
+			const uint8_t *ent = ufs_buffer + (uint64_t)e * size;
+			int used = 0, k;
+
+			for (k = 0; k < 16; k++) {
+				used |= ent[k];
+			}
+			if (used == 0) {
+				continue;
+			}
+			parts[n].index = e;
+			parts[n].first = *(const uint64_t *)(ent + 32);
+			parts[n].last = *(const uint64_t *)(ent + 40);
+			for (k = 0; k < 24; k++) {
+				uint16_t c = (uint16_t)ent[56 + 2 * k] | ((uint16_t)ent[56 + 2 * k + 1] << 8);
+
+				if (c == 0) {
+					break;
+				}
+				parts[n].name[k] = c < 0x80 ? (char)c : '?';
+			}
+			parts[n].name[k] = 0;
+			if (str_eq(parts[n].name, "super")) {
+				super_first = parts[n].first;
+				super_last = parts[n].last;
+				have_super = 1;
+			}
+			n++;
+		}
+
+		/* table order is LBA order on this device, but sort to be sure */
+		for (uint32_t i = 1; i < n; i++) {
+			for (uint32_t j = i; j > 0 && parts[j].first < parts[j - 1].first; j--) {
+				typeof(parts[0]) t = parts[j];
+
+				parts[j] = parts[j - 1];
+				parts[j - 1] = t;
+			}
+		}
+
+		for (uint32_t i = 0; i < n; i += 2) {
+			print("ufs: p%d %s %dM", (uint64_t)parts[i].index, parts[i].name,
+			    (parts[i].last - parts[i].first + 1) * bs >> 20);
+			if (i + 1 < n) {
+				print(" | p%d %s %dM", (uint64_t)parts[i + 1].index, parts[i + 1].name,
+				    (parts[i + 1].last - parts[i + 1].first + 1) * bs >> 20);
+			}
+			print("\n");
+		}
+
+		for (uint32_t i = 0; i < n; i++) {
+			uint64_t mb = (parts[i].last - parts[i].first + 1) * bs >> 20;
+
+			if (mb >= 1024) {
+				print("ufs: big p%d %s: lba %x..%x, %d MB\n", (uint64_t)parts[i].index,
+				    parts[i].name, parts[i].first, parts[i].last, mb);
+			}
+		}
+
+		{
+			uint64_t first_usable = *(const uint64_t *)(header + 40);
+			uint64_t last_usable = *(const uint64_t *)(header + 48);
+			uint64_t prev_end = first_usable;
+			uint64_t best_start = 0, best_end = 0, best = 0;
+
+			for (uint32_t i = 0; i < n; i++) {
+				if (parts[i].first > prev_end) {
+					uint64_t bytes = (parts[i].first - prev_end) * bs;
+
+					if (bytes > best) {
+						best = bytes;
+						best_start = prev_end;
+						best_end = parts[i].first - 1;
+					}
+				}
+				if (parts[i].last + 1 > prev_end) {
+					prev_end = parts[i].last + 1;
+				}
+			}
+			if (last_usable + 1 > prev_end) {
+				uint64_t bytes = (last_usable + 1 - prev_end) * bs;
+
+				if (bytes > best) {
+					best = bytes;
+					best_start = prev_end;
+					best_end = last_usable;
+				}
+			}
+			print("ufs: largest gap: lba %x..%x, %d MB\n", best_start, best_end, best >> 20);
+		}
+
+		if (have_super) {
+			ufs_analyze_super (bio, super_first, super_last);
+		}
+	}
+}
+
+/*
+ * The block device and LBA range of a GPT partition, by name: the system
+ * image is flashed at the start of "userdata" (the partition this port gives
+ * up), and run_kernel() reads it from there through the same BlockIo the
+ * survey uses. Read only.
+ */
+static efi_block_io *
+ufs_find_partition(const char *name, uint64_t *first_lba, uint64_t *blocks)
+{
+	static const efi_guid blk_guid = EFI_BLOCK_IO_GUID;
+	efi_handle *handles;
+	uint64_t count;
+
+	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &blk_guid, NULL, &count, &handles))) {
+		return NULL;
+	}
+	for (uint64_t i = 0; i < count; i++) {
+		efi_block_io *bio;
+		uint64_t bs, entries_lba, n, esz, bytes, read;
+		uint32_t hsize;
+		static uint8_t hdr[4096];
+
+		if (EFI_ERROR(BS->handle_protocol(handles[i], &blk_guid, (void **)&bio)) || bio->media->logical ||
+		    bio->media->block_size < 512 || bio->media->block_size > sizeof(hdr) ||
+		    bio->media->last_block < 2) {
+			continue;
+		}
+		bs = bio->media->block_size;
+		if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, 1, bs, hdr)) ||
+		    memcmp(hdr, "EFI PART", 8) != 0) {
+			continue;
+		}
+		hsize = *(uint32_t *)(hdr + 12);
+		entries_lba = *(uint64_t *)(hdr + 72);
+		n = *(uint32_t *)(hdr + 80);
+		esz = *(uint32_t *)(hdr + 84);
+		bytes = n * esz;
+		if (hsize < 92 || hsize > bs || esz < 128 || bytes == 0 || bytes > sizeof(ufs_buffer)) {
+			continue;
+		}
+		read = (bytes + bs - 1) / bs * bs;
+		if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, entries_lba, read, ufs_buffer))) {
+			continue;
+		}
+		for (uint64_t e = 0; e < n; e++) {
+			const uint8_t *ent = ufs_buffer + e * esz;
+			char pname[37];
+			int used = 0, k;
+
+			for (k = 0; k < 16; k++) {
+				used |= ent[k];
+			}
+			if (used == 0) {
+				continue;
+			}
+			for (k = 0; k < 36; k++) {
+				uint16_t c = (uint16_t)ent[56 + 2 * k] | ((uint16_t)ent[56 + 2 * k + 1] << 8);
+
+				if (c == 0) {
+					break;
+				}
+				pname[k] = c < 0x80 ? (char)c : '?';
+			}
+			pname[k] = 0;
+			if (str_eq(pname, name)) {
+				*first_lba = *(const uint64_t *)(ent + 32);
+				*blocks = *(const uint64_t *)(ent + 40) - *first_lba + 1;
+				return bio;
+			}
+		}
+	}
+	return NULL;
 }
 
 /* one line per 32 bytes: "ufs: PART WHAT +OFFSET: hex" */
@@ -1419,6 +2143,32 @@ ufs_survey(void)
 	static const efi_guid blk_guid = EFI_BLOCK_IO_GUID;
 	efi_handle *handles;
 	uint64_t count, units = 0, partitions = 0;
+
+	/*
+	 * What the UEFI storage stack left behind, before any block device is looked at:
+	 * the controller's registers as the last driver wrote them, and which of the UFS
+	 * drivers made it. A survey that finds no BlockIo otherwise says nothing about why.
+	 * The addresses are UFSHCI: CAP, VER, IS, IE, HCS, HCE, UECPA.
+	 */
+	{
+		volatile uint32_t *hci = (volatile uint32_t *)(uintptr_t)0x112B0000;
+		static const efi_guid hc_guid = { 0xebc01af5, 0x7a9, 0x489e,
+			{ 0xb7, 0xce, 0xdc, 0x08, 0x9e, 0x45, 0x9b, 0x2f } };
+		static const efi_guid cfg_guid = { 0xb81bfab0, 0x0eb3, 0x4cf9,
+			{ 0x84, 0x65, 0x7f, 0xa9, 0x86, 0x36, 0x16, 0x64 } };
+		static const efi_guid scsi_guid = { 0x143b7632, 0xb81b, 0x4cb7,
+			{ 0xab, 0xd3, 0xb6, 0x25, 0xa5, 0xb9, 0xbf, 0xfe } };
+		void *iface;
+
+		print("ufs: hci CAP=%x VER=%x IS=%x IE=%x HCS=%x HCE=%x UECPA=%x\n",
+		    (uint64_t)hci[0x00 / 4], (uint64_t)hci[0x08 / 4], (uint64_t)hci[0x20 / 4],
+		    (uint64_t)hci[0x24 / 4], (uint64_t)hci[0x30 / 4], (uint64_t)hci[0x34 / 4],
+		    (uint64_t)hci[0x38 / 4]);
+		print("ufs: protocols: hc %s, device config %s, scsi pass-thru %s\n",
+		    !EFI_ERROR(BS->locate_protocol(&hc_guid, NULL, &iface)) ? "yes" : "no",
+		    !EFI_ERROR(BS->locate_protocol(&cfg_guid, NULL, &iface)) ? "yes" : "no",
+		    !EFI_ERROR(BS->locate_protocol(&scsi_guid, NULL, &iface)) ? "yes" : "no");
+	}
 
 	/* the raw logical units: the block devices that are not partitions of another */
 	if (!EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &blk_guid, NULL, &count, &handles))) {
@@ -2270,6 +3020,175 @@ psci_call(uint64_t function, uint64_t a1, uint64_t a2, uint64_t a3)
 }
 
 /*
+ * Copy the last `cap` characters of loader_log, in order, into dst. The layout is the one
+ * loader_return.c keeps: a linear first part and then a ring; once the ring has wrapped the
+ * linear part is the oldest and the ring holds the newest 1 MB, oldest first from ring_at.
+ */
+static uint32_t
+copy_log_stream(char *dst, uint32_t cap, const char *log, uint32_t len, uint32_t ring_at,
+    uint32_t head, uint32_t ring, int wrapped)
+{
+	const char *seg[3];
+	uint32_t segn[3];
+	int ns = 0;
+	uint32_t total = 0, skip, out = 0;
+
+	if (ring_at > ring) {
+		ring_at = ring;
+	}
+	if (!wrapped) {
+		if (len > head + ring) {
+			len = head + ring;
+		}
+		seg[0] = log;
+		segn[0] = len;
+		ns = 1;
+	} else {
+		seg[0] = log;
+		segn[0] = head;
+		seg[1] = log + head + ring_at;
+		segn[1] = ring - ring_at;
+		seg[2] = log + head;
+		segn[2] = ring_at;
+		ns = 3;
+	}
+	for (int i = 0; i < ns; i++) {
+		total += segn[i];
+	}
+	skip = total > cap ? total - cap : 0;
+	for (int i = 0; i < ns && out < cap; i++) {
+		uint32_t n = segn[i];
+		const char *p;
+
+		if (skip >= n) {
+			skip -= n;
+			continue;
+		}
+		p = seg[i] + skip;
+		n -= skip;
+		skip = 0;
+		if (n > cap - out) {
+			n = cap - out;
+		}
+		memcpy(dst + out, p, n);
+		out += n;
+	}
+	return out;
+}
+
+/*
+ * Write the log into the next slot of userdata (see LOG_SLOT_*). Called on the monitor core
+ * while the kernel runs on another: the storage is this loader's (the kernel has no driver
+ * for this controller), and the firmware's Block I/O polls, so it needs no interrupts here.
+ */
+static void
+save_log_slot(const struct kernel_live *live, uint64_t slide)
+{
+	efi_block_io *bio = (efi_block_io *)(uintptr_t)monitor_args.slot_bio;
+	uint32_t bs = (uint32_t)monitor_args.slot_block_size;
+	struct log_slot_header *h = (struct log_slot_header *)log_slot_buf;
+	const char *log = (const char *)(uintptr_t)(live->log + slide);
+	uint32_t len, ring_at, n, text_off;
+	uint64_t slot, lba, freq = READ_SYSREG(CNTFRQ_EL0), blocks;
+	efi_status s;
+	int wrapped;
+
+	if (bio == NULL || bs == 0 || bs > LOG_SLOT_HEADER) {
+		log_slot_state = -1;
+		return;
+	}
+	text_off = (LOG_SLOT_HEADER + bs - 1) / bs * bs;
+	blocks = LOG_SLOT_SIZE / bs;
+	len = *(volatile uint32_t *)(live->log_len + slide);
+	ring_at = *(volatile uint32_t *)(live->log_ring_at + slide);
+	wrapped = *(volatile uint8_t *)(live->log_wrapped + slide);
+	n = copy_log_stream((char *)log_slot_buf + text_off, LOG_SLOT_SIZE - text_off, log, len, ring_at,
+	    (uint32_t)live->log_head, (uint32_t)live->log_ring, wrapped);
+
+	if (!hc_list_is_uefis()) {
+		log_slot_state = -2;            /* the kernel's own transfer list is in the controller */
+		return;
+	}
+	log_slot_seq++;
+	memset(h, 0, sizeof(*h));
+	h->magic = LOG_SLOT_MAGIC;
+	h->version = 1;
+	h->length = n;
+	h->total = wrapped ? (uint64_t)(live->log_head + live->log_ring) : len;
+	h->seq = log_slot_seq;
+	if (freq >= 1000) {
+		h->uptime_ms = READ_SYSREG(CNTVCT_EL0) / (freq / 1000);
+	}
+	h->crc = ufs_crc32((const uint8_t *)log_slot_buf + text_off, n);
+	clean_dcache((uint64_t)(uintptr_t)log_slot_buf, (uint64_t)(uintptr_t)log_slot_buf + LOG_SLOT_SIZE);
+	slot = log_slot_seq & 1;
+	lba = monitor_args.slot_first + LOG_SLOT_OFFSET / bs + slot * blocks;
+	s = bio->write_blocks(bio, bio->media->media_id, lba, LOG_SLOT_SIZE, log_slot_buf);
+	if (!EFI_ERROR(s)) {
+		bio->flush_blocks(bio);
+		log_slot_state = 1;
+	} else {
+		log_slot_state = (int)(s & 0x7f);
+	}
+	log_slot_total = n;
+}
+
+/* Start the log monitor on its own core (see monitor_main above). */
+extern char __ImageBase;
+
+static void
+monitor_start(const struct kernel_live *live, uint64_t slide, uint64_t probe)
+{
+	uint8_t *base = (uint8_t *)(uintptr_t)&__ImageBase;
+	uint32_t pe_off, image_size;
+	int64_t status;
+
+	if (live == NULL) {
+		print("monitor: the kernel has no loader_live; not started\n");
+		return;
+	}
+	monitor_args.live = (uint64_t)(uintptr_t)live;
+	monitor_args.slide = slide;
+	monitor_args.ustacks_probe = probe;
+	monitor_args.ttbr0 = READ_SYSREG(TTBR0_EL1);
+	monitor_args.tcr = READ_SYSREG(TCR_EL1);
+	monitor_args.mair = READ_SYSREG(MAIR_EL1);
+	monitor_args.sctlr = READ_SYSREG(SCTLR_EL1);
+	/* where the log can be kept: the free part of userdata (see LOG_SLOT_*) */
+	{
+		uint64_t first = 0, blocks = 0;
+		efi_block_io *bio = ufs_find_partition("userdata", &first, &blocks);
+
+		if (bio != NULL) {
+			uint64_t bs = bio->media->block_size;
+			uint64_t slot_blocks = bs != 0 ? LOG_SLOT_SIZE / bs : 0;
+
+			if (bs != 0 && bs <= LOG_SLOT_HEADER && LOG_SLOT_SIZE % bs == 0 &&
+			    LOG_SLOT_OFFSET / bs + 2 * slot_blocks <= blocks) {
+				monitor_args.slot_bio = (uint64_t)(uintptr_t)bio;
+				monitor_args.slot_first = first;
+				monitor_args.slot_blocks = blocks;
+				monitor_args.slot_block_size = bs;
+				print("monitor: the log is saved %d MB into userdata\n", (uint64_t)(LOG_SLOT_OFFSET >> 20));
+			} else {
+				print("monitor: userdata has no room for the log slots\n");
+			}
+		}
+	}
+	pe_off = *(uint32_t *)(base + 0x3c);
+	image_size = *(uint32_t *)(base + pe_off + 0x50);
+	if (image_size == 0 || image_size > 0x1000000) {
+		image_size = 0x800000;
+	}
+	/* that core starts with caches off: what it reads has to be in memory */
+	clean_dcache((uint64_t)(uintptr_t)base, (uint64_t)(uintptr_t)base + image_size);
+	clean_dcache((uint64_t)(uintptr_t)&monitor_args, (uint64_t)(uintptr_t)&monitor_args + sizeof(monitor_args));
+	clean_dcache((uint64_t)(uintptr_t)monitor_stack, (uint64_t)(uintptr_t)monitor_stack + sizeof(monitor_stack));
+	status = psci_call(PSCI_CPU_ON, MONITOR_MPIDR, (uint64_t)(uintptr_t)&monitor_entry, 0);
+	print("monitor: core %x for the log, PSCI %d\n", MONITOR_MPIDR, (uint64_t)status);
+}
+
+/*
  * Run the kernel on the core with that MPIDR and wait until it is back. Returns 0 when it has
  * been and gone (the caller goes on as after loader_return_stub), a negative number if the
  * firmware refused to start the core, OTHER_CPU_NOT_STARTED, or OTHER_CPU_HUNG: then the kernel
@@ -2282,6 +3201,9 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
     uint64_t budget)
 {
 	uint64_t daif = 0, group1 = 0, started, last_pet, last_battery, last_beat_at, last_beat = 0, noted = 0;
+	uint64_t last_render = 0;
+	uint32_t last_len = 0;
+	int quiet = 0;
 	int64_t status;
 	int arrived = 0, watching_only = 0;
 
@@ -2367,12 +3289,55 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 			last_battery = READ_SYSREG(CNTVCT_EL0);
 		}
 		if (arrived && live != NULL) {
+			uint32_t llen = *(volatile uint32_t *)(live->log_len + slide);
+
 			if (live->heartbeat != last_beat) {
 				last_beat = live->heartbeat;
 				last_beat_at = READ_SYSREG(CNTVCT_EL0);
+#ifdef MALACHITE_STAGES
+				/*
+				 * A small square in the top-right corner changes colour with
+				 * every heartbeat. The screen itself is the kernel's log.
+				 */
+				{
+					static const uint32_t beat[4] = {
+						0xFF0000FFu, 0xFF00FFFFu, 0xFFFFFF00u, 0xFFFF00FFu
+					};
+
+					stage_corner(beat[last_beat & 3], 1, 0, 40);
+				}
+#endif
+			}
+			/*
+			 * The heartbeat is only fed when the loader armed the watchdog
+			 * (a Qualcomm thing; not on this port), so the log growing is the
+			 * sign of life that matters here: a kernel printing through the
+			 * boot is alive even with loader_live.heartbeat stuck at zero.
+			 */
+			if (llen != last_len) {
+				last_len = llen;
+				last_beat_at = READ_SYSREG(CNTVCT_EL0);
+				quiet = 0;
 			} else if (seconds_since(last_beat_at) >= SILENCE_SECONDS) {
-				log_of_hung_kernel(live, slide);
-				status = OTHER_CPU_HUNG;
+				/*
+				 * Nothing printed for a while. That is not the same as dead (a
+				 * system waiting on a service is quiet), so just mark it in the
+				 * corner and keep watching: the marker goes away by itself when
+				 * the log grows again.
+				 */
+				quiet = 1;
+			}
+			/*
+			 * Put the tail of loader_log on the panel every two seconds: the
+			 * boot log (and user space's /dev/console output) is visible while
+			 * the kernel runs, without any help from it.
+			 */
+			if (seconds_since(last_render) >= 2) {
+				last_render = READ_SYSREG(CNTVCT_EL0);
+				render_kernel_log(live, slide);
+				if (quiet) {
+					stage_corner(0xFFFF0000u, 1, 1, 60);
+				}
 			}
 		}
 		if (block_enabled) {
@@ -2659,7 +3624,6 @@ static uint64_t win_base, win_size; /* XNU's physical memory window, claimed onc
 static uint64_t resident_rd_size;   /* root image kept at win_base + RESIDENT_RD_OFFSET, 0 if none */
 static char last_result[64] = "idle";
 
-#ifdef MALACHITE_STAGES
 /*
  * Bring-up on a device with no USB link: the UEFI's text console may be missing
  * or unreadable, so the last stage reached is painted on the whole panel, the
@@ -2676,6 +3640,7 @@ static char last_result[64] = "idle";
 #define STAGE_ORANGE   0xFFFF8000u      /* kernel and ramdisk loaded */
 #define STAGE_WHITE    0xFFFFFFFFu      /* about to jump to the kernel / return stub */
 
+#ifdef MALACHITE_STAGES
 static void
 stage_paint(uint32_t argb)
 {
@@ -2688,9 +3653,530 @@ stage_paint(uint32_t argb)
 		p[i] = argb;
 	}
 }
+
+/* A square marker in a corner: a colour that survives whatever the kernel draws. */
+static void
+stage_corner(uint32_t argb, int right, int bottom, unsigned px)
+{
+	volatile uint32_t *p;
+	uint64_t words, x0, y0;
+
+	if (SCREEN.base == 0 || SCREEN.stride == 0 || SCREEN.height == 0) {
+		return;
+	}
+	p = (volatile uint32_t *)(uintptr_t)SCREEN.base;
+	words = SCREEN.stride / 4;
+	x0 = right && words > px ? words - px : 0;
+	y0 = bottom && SCREEN.height > px ? SCREEN.height - px : 0;
+	for (uint64_t y = y0; y < y0 + px && y < SCREEN.height; y++) {
+		for (uint64_t x = x0; x < x0 + px && x < words; x++) {
+			p[y * words + x] = argb;
+		}
+	}
+}
 #else
 #define stage_paint(c) do { } while (0)
+#define stage_corner(c, r, b, p) do { } while (0)
 #endif
+
+/* ------------------------------------------------------------------------ */
+/* A framebuffer text console of our own                                    */
+/*                                                                          */
+/* The EFI text console has no output device on this port, and the kernel   */
+/* has no video console of its own: the only way to read a kernel log on a  */
+/* panel is to draw it here. The glyphs are the 5x12 set the UEFI console   */
+/* uses on this panel (crisp, known to read well there), doubled to 12x24   */
+/* pixel cells. The text area starts below the camera cutout and is inset   */
+/* from the rounded corners, which would otherwise cut the first and last   */
+/* columns of the top lines.                                                */
+
+#define FB_TEXT_SCALE  2
+#define FB_CELL_W      (6 * FB_TEXT_SCALE)     /* 5 pixels + one of spacing */
+#define FB_CELL_H      (12 * FB_TEXT_SCALE)
+#define FB_X0          28                      /* clear of the rounded sides */
+#define FB_Y0          120                     /* clear of the camera cutout */
+
+static void
+fb_char(uint64_t x, uint64_t y, char c, uint32_t fg)
+{
+	unsigned long long glyph;
+	volatile uint32_t *p;
+	uint64_t words, gx, gy;
+
+	if (SCREEN.base == 0 || SCREEN.stride == 0 || SCREEN.height == 0) {
+		return;
+	}
+	if (c < 32 || c > 126) {
+		c = '?';
+	}
+	glyph = font5x12[(unsigned char)c - 32];
+	p = (volatile uint32_t *)(uintptr_t)SCREEN.base;
+	words = SCREEN.stride / 4;
+	gx = x + FB_X0;
+	gy = y + FB_Y0;
+	for (unsigned row = 0; row < 12; row++) {
+		uint32_t bits = (row < 6) ? (uint32_t)(glyph >> 32) >> (5 * row) :
+		    (uint32_t)glyph >> (5 * (row - 6));
+
+		for (unsigned col = 0; col < 5; col++) {
+			uint64_t px, py;
+
+			if ((bits & (1u << col)) == 0) {
+				continue;
+			}
+			px = gx + (uint64_t)col * FB_TEXT_SCALE;
+			py = gy + (uint64_t)row * FB_TEXT_SCALE;
+			for (unsigned sy = 0; sy < FB_TEXT_SCALE; sy++) {
+				for (unsigned sx = 0; sx < FB_TEXT_SCALE; sx++) {
+					uint64_t ax = px + sx, ay = py + sy;
+
+					if (ax < SCREEN.width && ay < SCREEN.height && ax < words) {
+						p[ay * words + ax] = fg;
+					}
+				}
+			}
+		}
+	}
+}
+
+/*
+ * Draw the tail of a log (which ends with the interesting part: a panic) in
+ * green on black. Everything after the last full line that fits is shown.
+ */
+static void
+fb_render_log(const char *log, uint64_t len, uint32_t fg)
+{
+	uint64_t cols, rows, cap, start = 0, col = 0, row = 0;
+
+	if (SCREEN.base == 0 || SCREEN.stride == 0 || SCREEN.height == 0) {
+		return;
+	}
+	stage_paint(0xFF000000u);       /* black */
+	cols = (SCREEN.width > 2 * FB_X0) ? (SCREEN.width - 2 * FB_X0) / FB_CELL_W : 0;
+	rows = (SCREEN.height > FB_Y0 + FB_CELL_H) ? (SCREEN.height - FB_Y0 - 8) / FB_CELL_H : 0;
+	rows = (rows > fb_reserve_rows) ? rows - fb_reserve_rows : 0;
+	cap = cols * rows;
+	if (cols == 0 || rows == 0) {
+		return;
+	}
+	if (log == NULL || len == 0) {
+		static const char none[] = "no log yet";
+		for (uint64_t i = 0; none[i] && i / cols < rows; i++) {
+			fb_char((i % cols) * FB_CELL_W, (i / cols) * FB_CELL_H, none[i], fg);
+		}
+		return;
+	}
+	if (len > (2u << 20)) {
+		len = 2u << 20;
+	}
+	if (len > cap) {
+		start = len - cap;
+		/* begin at a line, not in its middle */
+		while (start < len && log[start] != '\n') {
+			start++;
+		}
+		if (start < len) {
+			start++;
+		}
+	}
+	for (uint64_t i = start; i < len && row < rows; i++) {
+		char c = log[i];
+
+		if (c == '\r') {
+			continue;
+		}
+		if (c == '\n') {
+			col = 0;
+			row++;
+			continue;
+		}
+		if (c == '\t') {
+			col = (col + 4) & ~(uint64_t)3;
+		} else if ((unsigned char)c < 32 || c == 127) {
+			continue;       /* NULs and other control bytes: nothing to draw */
+		} else {
+			fb_char(col * FB_CELL_W, row * FB_CELL_H, c, fg);
+			col++;
+		}
+		if (col >= cols) {
+			col = 0;
+			row++;
+		}
+	}
+}
+
+/* A line of our console: clear `lines` rows and draw the text in them. */
+static void
+fb_status_clear(unsigned lines)
+{
+	volatile uint32_t *p;
+	uint64_t words, ymax;
+
+	if (SCREEN.base == 0 || SCREEN.stride == 0 || SCREEN.height == 0) {
+		return;
+	}
+	p = (volatile uint32_t *)(uintptr_t)SCREEN.base;
+	words = SCREEN.stride / 4;
+	ymax = (uint64_t)FB_Y0 + (uint64_t)lines * FB_CELL_H;
+	for (uint64_t y = 0; y < ymax && y < SCREEN.height; y++) {
+		for (uint64_t x = 0; x < words; x++) {
+			p[y * words + x] = 0xFF000000u;
+		}
+	}
+}
+
+static unsigned
+fb_u64(char *out, uint64_t v)
+{
+	char tmp[24];
+	unsigned n = 0;
+
+	do {
+		tmp[n++] = (char)('0' + (v % 10));
+		v /= 10;
+	} while (v);
+	for (unsigned i = 0; i < n; i++) {
+		out[i] = tmp[n - 1 - i];
+	}
+	return n;
+}
+
+static void
+fb_line(unsigned line, const char *s, uint32_t fg)
+{
+	for (unsigned i = 0; s[i]; i++) {
+		fb_char((uint64_t)i * FB_CELL_W, (uint64_t)line * FB_CELL_H, s[i], fg);
+	}
+}
+
+static unsigned
+fb_hex(char *out, uint64_t v)
+{
+	static const char hex[] = "0123456789abcdef";
+	char tmp[16];
+	unsigned n = 0;
+
+	do {
+		tmp[n++] = hex[v & 15];
+		v >>= 4;
+	} while (v);
+	out[0] = '0';
+	out[1] = 'x';
+	for (unsigned i = 0; i < n; i++) {
+		out[2 + i] = tmp[n - 1 - i];
+	}
+	return 2 + n;
+}
+
+static void
+fb_row_clear(uint64_t line)
+{
+	volatile uint32_t *p;
+	uint64_t words, y0, ymax;
+
+	if (SCREEN.base == 0 || SCREEN.stride == 0 || SCREEN.height == 0) {
+		return;
+	}
+	p = (volatile uint32_t *)(uintptr_t)SCREEN.base;
+	words = SCREEN.stride / 4;
+	y0 = FB_Y0 + line * FB_CELL_H;
+	ymax = y0 + FB_CELL_H;
+	if (ymax > SCREEN.height) {
+		ymax = SCREEN.height;
+	}
+	for (uint64_t y = y0; y < ymax; y++) {
+		for (uint64_t x = 0; x < words; x++) {
+			p[y * words + x] = 0xFF000000u;
+		}
+	}
+}
+
+/*
+ * The monitor's bottom line: characters that have arrived since it started (a count that only
+ * goes up, even after the log's ring has wrapped), and how many noise lines the retained log
+ * holds now -- that second number falls as old lines are overwritten, which is not a fault.
+ */
+static void
+monitor_footer(uint64_t new_bytes, unsigned hidden)
+{
+	static const char lead[] = "console +";
+	static const char mid[] = " KiB since start, noise now: ";
+	char buf[96];
+	unsigned n = 0;
+	uint64_t rows;
+
+	for (unsigned i = 0; lead[i] != 0; i++) {
+		buf[n++] = lead[i];
+	}
+	n += fb_u64(buf + n, new_bytes >> 10);
+	for (unsigned i = 0; mid[i] != 0; i++) {
+		buf[n++] = mid[i];
+	}
+	n += fb_u64(buf + n, hidden);
+	if (log_slot_state == 1) {
+		static const char tail[] = ", saved #";
+
+		for (unsigned i = 0; tail[i] != 0; i++) {
+			buf[n++] = tail[i];
+		}
+		n += fb_u64(buf + n, log_slot_seq);
+	} else if (log_slot_state != 0) {
+		static const char bad[] = ", save failed";
+
+		for (unsigned i = 0; bad[i] != 0; i++) {
+			buf[n++] = bad[i];
+		}
+	}
+	buf[n] = 0;
+
+	rows = (SCREEN.height > FB_Y0 + FB_CELL_H) ? (SCREEN.height - FB_Y0 - 8) / FB_CELL_H : 0;
+	if (rows == 0) {
+		return;
+	}
+	fb_row_clear(rows - 1);
+	fb_line((unsigned)(rows - 1), buf, 0xFF9A9A9Au);
+}
+
+/*
+ * The second bottom line with ustacks_probe=1: the kernel's own sampler state, read where it
+ * lives (the addresses are the kernel's symbol table's, unslid; the monitor's slide makes them
+ * readable on its core too). "call" is the thread call ustacks_init allocated -- 0 means the boot
+ * argument was not taken; "cnt" is ustacks_count as it stands, and it falls by one for every fire,
+ * so a value that never moves while call is set is a thread call that never ran. A cnt that falls
+ * while the log has no "ustacks:" lines is a fire that found no process of that name.
+ *
+ * The addresses belong to prebuilt/mach.development.bcm2837, the kernel these images carry; a
+ * rebuilt one moves them, and this line would then only be showing whatever happened to be there.
+ */
+#define USTACKS_NAME_VA    0xfffffff007e7e000ULL
+#define USTACKS_CALL_VA    0xfffffff007e7e020ULL
+#define USTACKS_COUNT_VA   0xfffffff007e7e068ULL
+#define USTACKS_EVERY_VA   0xfffffff007e7e06cULL
+#define USTACKS_THREADS_VA 0xfffffff007af5268ULL
+#define USTACKS_TNAME_VA   0xfffffff007e8a780ULL
+
+static void
+monitor_ustacks(uint64_t slide)
+{
+	char buf[192];
+	static const char lead[] = "ustacks call=";
+	unsigned n = 0;
+	uint64_t call = *(volatile uint64_t *)(uintptr_t)(USTACKS_CALL_VA + slide);
+	uint32_t count = *(volatile uint32_t *)(uintptr_t)(USTACKS_COUNT_VA + slide);
+	uint32_t every = *(volatile uint32_t *)(uintptr_t)(USTACKS_EVERY_VA + slide);
+	uint32_t threads = *(volatile uint32_t *)(uintptr_t)(USTACKS_THREADS_VA + slide);
+	const char *name = (const char *)(uintptr_t)(USTACKS_NAME_VA + slide);
+	const char *tname = (const char *)(uintptr_t)(USTACKS_TNAME_VA + slide);
+	uint64_t rows;
+
+#define PUT_LIT(s) do { \
+	for (unsigned i_ = 0; (s)[i_] != 0 && n < sizeof(buf) - 1; i_++) { \
+		buf[n++] = (s)[i_]; \
+	} \
+} while (0)
+#define PUT_TEXT(s) do { \
+	for (unsigned i_ = 0; i_ < 31 && (s)[i_] != 0 && n < sizeof(buf) - 1; i_++) { \
+		char ch_ = (s)[i_]; \
+		buf[n++] = (ch_ >= 32 && ch_ < 127) ? ch_ : '.'; \
+	} \
+} while (0)
+
+	PUT_LIT(lead);
+	n += fb_hex(buf + n, call);
+	PUT_LIT(" name=");
+	PUT_TEXT(name);
+	PUT_LIT(" cnt=");
+	n += fb_u64(buf + n, count);
+	PUT_LIT(" ev=");
+	n += fb_u64(buf + n, every);
+	PUT_LIT(" thr=");
+	n += fb_u64(buf + n, threads);
+	PUT_LIT(" tn=");
+	PUT_TEXT(tname);
+	buf[n] = 0;
+#undef PUT_TEXT
+#undef PUT_LIT
+
+	rows = (SCREEN.height > FB_Y0 + FB_CELL_H) ? (SCREEN.height - FB_Y0 - 8) / FB_CELL_H : 0;
+	if (rows < 2) {
+		return;
+	}
+	fb_row_clear(rows - 2);
+	fb_line((unsigned)(rows - 2), buf, 0xFFB0B0FFu);
+}
+
+/*
+ * What power mode the UFS link ended up in: a UIC DME_GET for PA_PWR_MODE.
+ * EDK2's UfsPassThru only performs link startup, never a PA_PWR_MODE change
+ * to a high-speed gear; the value here says whether the link is still on a
+ * PWM gear (low nibble 1..3) or an HS one (4..7), and how many lanes.
+ * Bits: [3:0] mode, [5:4] gear, [7:6] lanes.
+ */
+static uint64_t
+ufs_dme_get(uint32_t attr)
+{
+	volatile uint32_t *h = (volatile uint32_t *)(uintptr_t)0x112B0000;
+	uint64_t deadline, now;
+	uint32_t is;
+
+	is = h[0x20 / 4];
+	if (is & 0x400u) {              /* IS.UCCS: clear a stale completion */
+		h[0x20 / 4] = is;
+	}
+	h[0x94 / 4] = attr << 16;      /* UIC_ARG_MIB: MIB id in the high half */
+	h[0x98 / 4] = 0;
+	h[0x9c / 4] = 0;
+	deadline = READ_SYSREG(CNTVCT_EL0) + READ_SYSREG(CNTFRQ_EL0);
+	while ((h[0x30 / 4] & 0x1u) == 0) {     /* HCS.UCRDY */
+		if (READ_SYSREG(CNTVCT_EL0) > deadline) {
+			return 0x1000000;
+		}
+	}
+	h[0x90 / 4] = 0x01;             /* UIC DME_GET */
+	deadline = READ_SYSREG(CNTVCT_EL0) + READ_SYSREG(CNTFRQ_EL0);
+	while ((h[0x20 / 4] & 0x400u) == 0) {   /* IS.UCCS */
+		if (READ_SYSREG(CNTVCT_EL0) > deadline) {
+			return 0x2000000;
+		}
+	}
+	if ((h[0x98 / 4] & 0xffu) != 0) {       /* command result */
+		return 0x3000000u | (h[0x98 / 4] & 0xffu);
+	}
+	now = h[0x9c / 4];             /* value */
+	return now;
+}
+
+static uint64_t
+ufs_dme_set(uint32_t attr, uint32_t value)
+{
+	volatile uint32_t *h = (volatile uint32_t *)(uintptr_t)0x112B0000;
+	uint64_t deadline;
+	uint32_t is;
+
+	is = h[0x20 / 4];
+	if (is & 0x400u) {
+		h[0x20 / 4] = is;
+	}
+	h[0x94 / 4] = attr << 16;
+	h[0x98 / 4] = 0;
+	h[0x9c / 4] = value;
+	deadline = READ_SYSREG(CNTVCT_EL0) + READ_SYSREG(CNTFRQ_EL0);
+	while ((h[0x30 / 4] & 0x1u) == 0) {
+		if (READ_SYSREG(CNTVCT_EL0) > deadline) {
+			return 0x1000000;
+		}
+	}
+	h[0x90 / 4] = 0x02;             /* UIC DME_SET */
+	deadline = READ_SYSREG(CNTVCT_EL0) + READ_SYSREG(CNTFRQ_EL0);
+	while ((h[0x20 / 4] & 0x400u) == 0) {
+		if (READ_SYSREG(CNTVCT_EL0) > deadline) {
+			return 0x2000000;
+		}
+	}
+	if ((h[0x98 / 4] & 0xffu) != 0) {
+		return 0x3000000u | (h[0x98 / 4] & 0xffu);
+	}
+	return 0;
+}
+
+/*
+ * Move the link from the PWM gear the EDK2 driver leaves it in to an HS one
+ * (the sequence is the one a UEFI UFS stack for phones uses): set both gears,
+ * the active lanes, termination and the HS series, then PA_PWRMODE with FAST
+ * (HS) TX and RX; the controller's HCS.UPMCRS reports whether it took. Tries
+ * the device's highest gear first and walks down. Returns 1 and the gear when
+ * one worked, 0 when the link stays in PWM.
+ */
+static int
+ufs_hs_switch(uint64_t *gear_out, uint64_t *lanes_out)
+{
+	volatile uint32_t *h = (volatile uint32_t *)(uintptr_t)0x112B0000;
+	uint64_t maxgear = ufs_dme_get(0x1587);        /* PA_MaxRxHSGear */
+	uint64_t lanes = ufs_dme_get(0x1560);          /* PA_ActiveTxDataLanes */
+
+	if (maxgear < 1 || maxgear > 4) {
+		maxgear = 4;
+	}
+	if (lanes < 1 || lanes > 2) {
+		lanes = 2;
+	}
+	for (uint64_t g = maxgear; g >= 1; g--) {
+		if (ufs_dme_set(0x1583, (uint32_t)g) != 0 ||   /* PA_RxGear */
+		    ufs_dme_set(0x1568, (uint32_t)g) != 0 ||   /* PA_TxGear */
+		    ufs_dme_set(0x1580, (uint32_t)lanes) != 0 || /* PA_ActiveRxLanes */
+		    ufs_dme_set(0x1560, (uint32_t)lanes) != 0 || /* PA_ActiveTxLanes */
+		    ufs_dme_set(0x1584, 1) != 0 ||             /* PA_RxTermination */
+		    ufs_dme_set(0x1569, 1) != 0 ||             /* PA_TxTermination */
+		    ufs_dme_set(0x156A, 2) != 0) {             /* PA_HSSeries: rate B */
+			continue;
+		}
+		if (ufs_dme_set(0x1571, 0x11) != 0) {          /* PA_PWRMODE: HS, TX+RX FAST */
+			continue;
+		}
+		if (((h[0x30 / 4] >> 8) & 7u) == 1u) {         /* HCS.UPMCRS == PWR_LOCAL */
+			*gear_out = g;
+			*lanes_out = lanes;
+			return 1;
+		}
+		/* not taken: back to the PWM defaults before the next gear */
+		ufs_dme_set(0x1571, 0x22);
+	}
+	return 0;
+}
+
+static uint64_t sysimg_pwr;
+static uint64_t sysimg_gear;
+static uint64_t sysimg_lanes;
+
+/* The UFS read's progress, on the panel: MB read, seconds, and the mode. */
+static void
+sysimg_status(uint64_t done, uint64_t want, uint64_t started, uint64_t lba, int bounce,
+    uint64_t dma_ms, uint64_t copy_ms)
+{
+	char buf[96];
+	unsigned n = 0;
+	const char *s;
+	uint64_t secs = (READ_SYSREG(CNTVCT_EL0) - started) / READ_SYSREG(CNTFRQ_EL0);
+	uint64_t mbs = secs ? (done >> 20) / secs : 0;
+
+	s = "sysimg ";
+	while (*s) buf[n++] = *s++;
+	n += fb_u64(buf + n, done >> 20);
+	buf[n++] = '/';
+	n += fb_u64(buf + n, want >> 20);
+	s = " MB  ";
+	while (*s) buf[n++] = *s++;
+	n += fb_u64(buf + n, mbs);
+	s = " MB/s pwr ";
+	while (*s) buf[n++] = *s++;
+	n += fb_hex(buf + n, sysimg_pwr);
+	buf[n] = 0;
+	fb_status_clear(2);
+	fb_line(0, buf, 0xFF00FF00u);
+
+	n = 0;
+	if (sysimg_gear != 0) {
+		s = "HS G";
+		while (*s) buf[n++] = *s++;
+		buf[n++] = (char)('0' + (sysimg_gear % 10));
+		s = " L";
+		while (*s) buf[n++] = *s++;
+		buf[n++] = (char)('0' + (sysimg_lanes % 10));
+	} else {
+		s = "HS FAIL";
+		while (*s) buf[n++] = *s++;
+	}
+	s = bounce ? " bounce dma " : " direct dma ";
+	while (*s) buf[n++] = *s++;
+	n += fb_u64(buf + n, dma_ms);
+	s = " ms copy ";
+	while (*s) buf[n++] = *s++;
+	n += fb_u64(buf + n, copy_ms);
+	s = " ms";
+	while (*s) buf[n++] = *s++;
+	buf[n] = 0;
+	fb_line(1, buf, 0xFF00FF00u);
+}
 
 static void
 set_result(const char *what, uint64_t a, uint64_t b)
@@ -2794,6 +4280,358 @@ choose_window(const struct payload_info *pi)
 	win_base = best_base;
 	win_size = best_size;
 	return 1;
+}
+
+/*
+ * Paging for the saved log. Page starts are byte offsets into prev_text; a page is exactly
+ * what fills `rows` rows of `cols` columns, with the rules fb_render_log draws by, so the
+ * pages tile the text without gaps and every press moves one screenful.
+ */
+#define PREV_MAX_PAGES 4096
+static const char *prev_text;
+static uint32_t prev_len;
+static uint32_t prev_page[PREV_MAX_PAGES];
+static uint32_t prev_pages;
+
+static uint32_t
+prev_page_extent(uint32_t start, uint32_t cols, uint32_t rows)
+{
+	uint32_t col = 0, row = 0, i = start;
+
+	while (i < prev_len) {
+		char c = prev_text[i];
+
+		if (c == '\r') {
+			i++;
+			continue;
+		}
+		if (c == '\n') {
+			col = 0;
+			row++;
+			i++;
+		} else if (c == '\t') {
+			col = (col + 4) & ~3u;
+			i++;
+		} else if ((unsigned char)c < 32 || c == 127) {
+			i++;
+			continue;
+		} else {
+			col++;
+			i++;
+		}
+		if (col >= cols) {
+			col = 0;
+			row++;
+		}
+		if (row >= rows) {
+			break;
+		}
+	}
+	return i;
+}
+
+static void
+prev_render(uint32_t start, uint32_t end, uint32_t cols, uint32_t rows, uint32_t fg)
+{
+	uint32_t col = 0, row = 0;
+
+	stage_paint(0xFF000000u);
+	for (uint32_t i = start; i < end && row < rows; i++) {
+		char c = prev_text[i];
+
+		if (c == '\r') {
+			continue;
+		}
+		if (c == '\n') {
+			col = 0;
+			row++;
+			continue;
+		}
+		if (c == '\t') {
+			col = (col + 4) & ~3u;
+		} else if ((unsigned char)c < 32 || c == 127) {
+			continue;
+		} else {
+			fb_char((uint64_t)col * FB_CELL_W, (uint64_t)row * FB_CELL_H, c, fg);
+			col++;
+		}
+		if (col >= cols) {
+			col = 0;
+			row++;
+		}
+	}
+}
+
+static void
+prev_compute_pages(uint32_t cols, uint32_t rows)
+{
+	uint32_t at = 0;
+
+	prev_pages = 0;
+	while (at < prev_len) {
+		uint32_t next;
+
+		if (prev_pages == PREV_MAX_PAGES) {
+			/* keep the newest pages: drop the older half and go on */
+			memcpy(prev_page, prev_page + PREV_MAX_PAGES / 2,
+			    (PREV_MAX_PAGES / 2) * sizeof(prev_page[0]));
+			prev_pages = PREV_MAX_PAGES / 2;
+		}
+		prev_page[prev_pages++] = at;
+		next = prev_page_extent(at, cols, rows);
+		if (next <= at) {
+			break;
+		}
+		at = next;
+	}
+}
+
+/*
+ * A copy of the saved log with only the lines that say "ustacks:". The rest of a boot log is a
+ * wall of launchd and lsd chatter; this is the same viewer with the thread snapshots only.
+ */
+static int
+line_has_ustacks(const char *p, uint32_t n)
+{
+	static const char want[] = "ustacks:";
+
+	for (uint32_t i = 0; i + 8 <= n; i++) {
+		uint32_t k = 0;
+
+		while (k < 8 && p[i + k] == want[k]) {
+			k++;
+		}
+		if (k == 8) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static uint32_t
+filter_ustacks(const char *src, uint32_t len, char *dst, uint32_t cap)
+{
+	uint32_t line = 0, out = 0;
+
+	while (line < len && out < cap) {
+		uint32_t end = line, n;
+
+		while (end < len && src[end] != '\n') {
+			end++;
+		}
+		if (line_has_ustacks(src + line, end - line)) {
+			n = end - line;
+			if (n > cap - out) {
+				n = cap - out;
+			}
+			memcpy(dst + out, src + line, n);
+			out += n;
+			if (out < cap) {
+				dst[out++] = '\n';
+			}
+		}
+		line = end + 1;
+	}
+	return out;
+}
+
+/*
+ * showprev=1 / showprev=ustacks: draw the newest log the monitor core saved in userdata, then
+ * stay there. Both slots are looked at; a slot counts when its header is intact and the CRC of
+ * its text matches, and the one with the higher sequence number wins. With ust_only only the
+ * "ustacks:" lines are shown. The volume key pages: a short press (SCAN_UP) back, a press held
+ * past 700 ms (Enter) forward.
+ */
+static void
+show_previous_log(int ust_only)
+{
+	static const char none[] = "no saved log in userdata";
+	static const char bad[] = "the saved slots are corrupt";
+	uint64_t first = 0, blocks = 0;
+	efi_block_io *bio = ufs_find_partition("userdata", &first, &blocks);
+	uint64_t bs, slot_blocks, best_seq = 0;
+	uint32_t text_off;
+	int best = -1;
+
+	if (bio == NULL) {
+		fb_render_log(none, sizeof(none) - 1, 0xFFFF0000u);
+		return;
+	}
+	bs = bio->media->block_size;
+	if (bs == 0 || bs > LOG_SLOT_HEADER) {
+		fb_render_log(bad, sizeof(bad) - 1, 0xFFFF0000u);
+		return;
+	}
+	text_off = (LOG_SLOT_HEADER + bs - 1) / bs * bs;
+	slot_blocks = LOG_SLOT_SIZE / bs;
+	for (int slot = 0; slot < 2; slot++) {
+		uint64_t lba = first + LOG_SLOT_OFFSET / bs + (uint64_t)slot * slot_blocks;
+		struct log_slot_header *h;
+
+		if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, lba, bs, log_slot_buf))) {
+			continue;
+		}
+		flush_dcache((uint64_t)(uintptr_t)log_slot_buf, (uint64_t)(uintptr_t)log_slot_buf + bs);
+		h = (struct log_slot_header *)log_slot_buf;
+		if (h->magic != LOG_SLOT_MAGIC || h->version != 1 || h->length > LOG_SLOT_SIZE - text_off) {
+			continue;
+		}
+		if (best < 0 || h->seq > best_seq) {
+			best = slot;
+			best_seq = h->seq;
+		}
+	}
+	if (best < 0) {
+		fb_render_log(none, sizeof(none) - 1, 0xFFFF0000u);
+		return;
+	}
+	for (int tries = 0; tries < 2; tries++) {
+		uint64_t lba = first + LOG_SLOT_OFFSET / bs + (uint64_t)best * slot_blocks;
+		struct log_slot_header *h;
+
+		if (!EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, lba, LOG_SLOT_SIZE, log_slot_buf))) {
+			flush_dcache((uint64_t)(uintptr_t)log_slot_buf, (uint64_t)(uintptr_t)log_slot_buf + LOG_SLOT_SIZE);
+			h = (struct log_slot_header *)log_slot_buf;
+			if (h->magic == LOG_SLOT_MAGIC && h->version == 1 &&
+			    h->length <= LOG_SLOT_SIZE - text_off &&
+			    ufs_crc32((const uint8_t *)log_slot_buf + text_off, h->length) == h->crc) {
+				efi_simple_text_input *in[8];
+				unsigned nin = 0;
+				uint64_t cols, rows_all, rows;
+				uint64_t freq = READ_SYSREG(CNTFRQ_EL0);
+				uint32_t page;
+				char foot[128];
+
+				if (h->length == 0) {
+					static const char empty[] = "the saved log is empty";
+
+					fb_render_log(empty, sizeof(empty) - 1, 0xFFFF0000u);
+					return;
+				}
+				if (ust_only) {
+					uint32_t n = filter_ustacks((const char *)log_slot_buf + text_off, h->length,
+					    out_buf, sizeof(out_buf));
+
+					if (n == 0) {
+						static const char noun[] = "no ustacks lines in the saved log";
+
+						fb_render_log(noun, sizeof(noun) - 1, 0xFFFF0000u);
+						return;
+					}
+					prev_text = out_buf;
+					prev_len = n;
+				} else {
+					prev_text = (const char *)log_slot_buf + text_off;
+					prev_len = h->length;
+				}
+				cols = (SCREEN.width > 2 * FB_X0) ? (SCREEN.width - 2 * FB_X0) / FB_CELL_W : 0;
+				rows_all = (SCREEN.height > FB_Y0 + FB_CELL_H) ? (SCREEN.height - FB_Y0 - 8) / FB_CELL_H : 0;
+				if (cols == 0 || rows_all < 2) {
+					fb_render_log(prev_text, prev_len, 0xFF00FF00u);
+					return;
+				}
+				rows = rows_all - 1;            /* the last row is the footer */
+				prev_compute_pages((uint32_t)cols, (uint32_t)rows);
+				page = prev_pages - 1;
+				/*
+				 * The key may already have left the keypad's own queue: the firmware's console
+				 * splitter reads it first (the Boot Manager's menu listens for that same SCAN_UP).
+				 * So read the console input the firmware itself uses, and every SimpleTextIn
+				 * instance besides, and take a key from whichever has one.
+				 */
+				if (ST->con_in != NULL) {
+					in[nin++] = (efi_simple_text_input *)ST->con_in;
+				}
+				{
+					efi_guid in_guid = EFI_SIMPLE_TEXT_INPUT_GUID;
+					efi_handle *handles = NULL;
+					uint64_t count = 0;
+
+					if (!EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &in_guid, NULL, &count, &handles))) {
+						for (uint64_t i = 0; i < count && nin < 8; i++) {
+							efi_simple_text_input *p = NULL;
+							int dup = 0;
+
+							if (EFI_ERROR(BS->handle_protocol(handles[i], &in_guid, (void **)&p)) || p == NULL) {
+								continue;
+							}
+							for (unsigned k = 0; k < nin; k++) {
+								if (in[k] == p) {
+									dup = 1;
+								}
+							}
+							if (!dup) {
+								in[nin++] = p;
+							}
+						}
+					}
+				}
+				for (;;) {
+					uint32_t end = (page + 1 < prev_pages) ? prev_page[page + 1] : prev_len;
+					unsigned n = 0;
+					static const char p1[] = "page ";
+					static const char p2[] = "  short press: older, long press: newer  saved at ";
+					static const char p3[] = " s, seq ";
+
+					for (unsigned i = 0; p1[i] != 0; i++) {
+						foot[n++] = p1[i];
+					}
+					n += fb_u64(foot + n, page + 1);
+					foot[n++] = '/';
+					n += fb_u64(foot + n, prev_pages);
+					for (unsigned i = 0; p2[i] != 0; i++) {
+						foot[n++] = p2[i];
+					}
+					n += fb_u64(foot + n, h->uptime_ms / 1000);
+					for (unsigned i = 0; p3[i] != 0; i++) {
+						foot[n++] = p3[i];
+					}
+					n += fb_u64(foot + n, h->seq);
+					foot[n] = 0;
+					prev_render(prev_page[page], end, (uint32_t)cols, (uint32_t)rows, 0xFF00FF00u);
+					fb_row_clear(rows_all - 1);
+					fb_line((unsigned)(rows_all - 1), foot, 0xFF9A9A9Au);
+					if (nin == 0) {
+						return;         /* no key input: leave the newest page up */
+					}
+					{
+						uint8_t key = 0;
+						uint64_t began = READ_SYSREG(CNTVCT_EL0);
+
+						/*
+						 * Wait for a key, but come back every half second to redraw: the
+						 * firmware prints its own "volume up pressed/released" lines to the
+						 * framebuffer and those would sit on top of the page.
+						 */
+						while (key == 0) {
+							for (unsigned i = 0; i < nin && key == 0; i++) {
+								efi_input_key k;
+
+								if (!EFI_ERROR(in[i]->read_key_stroke(in[i], &k))) {
+									if (k.scan_code == SCAN_UP) {
+										key = 1;
+									} else if (k.unicode_char == 0x0D) {
+										key = 2;
+									}
+								}
+							}
+							if (key != 0 || READ_SYSREG(CNTVCT_EL0) - began >= freq / 2) {
+								break;
+							}
+							BS->stall(20000);
+						}
+						if (key == 1 && page > 0) {
+							page--;
+						} else if (key == 2 && page + 1 < prev_pages) {
+							page++;
+						}
+					}
+				}
+			}
+		}
+		best ^= 1;                      /* the other slot, once */
+	}
+	fb_render_log(bad, sizeof(bad) - 1, 0xFFFF0000u);
 }
 
 /*
@@ -2934,7 +4772,13 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	/* "bootcpu=N" among the kernel's arguments: run it on core N (see run_on_other_cpu) */
 	uint64_t this_mpidr = READ_SYSREG(MPIDR_EL1) & 0xFFFFFF, kernel_mpidr = this_mpidr;
 	/* "cpus=N" or "cpumask=M" there too: the kernel may have more cores than the one it starts on */
-	int more_cores = 0, battery_requested = 0, ufs_requested = 0;
+	int more_cores = 0, battery_requested = 0, ufs_requested = 0, memmap_requested = 0, sysimg_requested = 0;
+	int sysimg_test = 0;
+	int sysimg_bounce = 0;
+	int monitor_requested = 0;
+	int kret_hold = 0;
+	int showprev_mode = 0;         /* showprev=1: the saved log; showprev=ustacks: its ustacks lines */
+	int ustacks_probe = 0;         /* ustacks_probe=1: the monitor shows ustacks_*'s state too */
 	/* "torch=N" (not 0) there too: the phone's flashlight is the kernel's (bsd/dev/redwood_torch.c) */
 	int torch_requested = 0;
 	/* "cam=5" there too: the phone's wide camera is iOS's (bsd/dev/redwood_camera.c) */
@@ -2959,17 +4803,213 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		    (c[5] == 0 || c[5] == ' ')) {
 			ufs_requested = c[4] - '0';
 		}
+		memmap_requested |= starts_with(c, "memmap=1") && (c == pi.cmdline || c[-1] == ' ');
+		sysimg_requested |= starts_with(c, "sysimg=ufs") && (c == pi.cmdline || c[-1] == ' ') &&
+		    (c[10] == 0 || c[10] == ' ');
+		sysimg_test |= starts_with(c, "sysimg_test=1") && (c == pi.cmdline || c[-1] == ' ') &&
+		    (c[13] == 0 || c[13] == ' ');
+		sysimg_bounce |= starts_with(c, "sysimg_bounce=1") && (c == pi.cmdline || c[-1] == ' ') &&
+		    (c[15] == 0 || c[15] == ' ');
+		kret_hold |= starts_with(c, "kret_hold=1") && (c == pi.cmdline || c[-1] == ' ') &&
+		    (c[11] == 0 || c[11] == ' ');
+		monitor_requested |= starts_with(c, "monitor=1") && (c == pi.cmdline || c[-1] == ' ') &&
+		    (c[9] == 0 || c[9] == ' ');
+		ustacks_probe |= starts_with(c, "ustacks_probe=1") && (c == pi.cmdline || c[-1] == ' ') &&
+		    (c[15] == 0 || c[15] == ' ');
 		block_probe_requested |= starts_with(c, "ufs_probe=1") && (c == pi.cmdline || c[-1] == ' ');
 		block_write_requested |= starts_with(c, "ufs_write=1") && (c == pi.cmdline || c[-1] == ' ') &&
 		    (c[11] == 0 || c[11] == ' ');
 		hc_requested |= starts_with(c, "ufs_native=") && (c == pi.cmdline || c[-1] == ' ') && c[11] >= '1' &&
 		    c[11] <= '9';
+		if (starts_with(c, "showprev=ustacks") && (c == pi.cmdline || c[-1] == ' ') &&
+		    (c[16] == 0 || c[16] == ' ')) {
+			showprev_mode = 2;
+		} else if (starts_with(c, "showprev=1") && (c == pi.cmdline || c[-1] == ' ') &&
+		    (c[10] == 0 || c[10] == ' ')) {
+			showprev_mode = 1;
+		}
+	}
+	if (showprev_mode != 0) {
+		show_previous_log(showprev_mode == 2);
+		for (;;) {
+			__asm__ volatile("wfi");
+		}
+	}
+#ifdef MALACHITE_PARSE_HALT
+	/* Bring-up: what did the payload actually say? White screen; a red square
+	 * top-left if kret_hold was parsed, a blue one top-right if sysimg=ufs
+	 * was. Then stop, so a photo answers it in seconds. */
+	stage_paint(STAGE_WHITE);
+	if (kret_hold) {
+		stage_corner(STAGE_RED, 0, 0, 300);
+	}
+	if (sysimg_requested) {
+		stage_corner(STAGE_BLUE, 1, 0, 300);
+	}
+	for (;;) {
+		__asm__ volatile("wfi");
+	}
+#endif
+	if (sysimg_requested) {
+		uint64_t dest = phys_base + RESIDENT_RD_OFFSET;
+		uint64_t want = resident_rd_size;
+		uint64_t first = 0, blocks = 0, done = 0;
+		uint64_t started = READ_SYSREG(CNTVCT_EL0);
+		efi_block_io *bio = ufs_find_partition("userdata", &first, &blocks);
+
+		/* The panel is this read's progress meter: black, with the megabytes
+		 * done and how they were read. A stalled read leaves its last number
+		 * on screen, which says where it stopped. */
+		/*
+		 * The EDK2 driver never leaves the PWM gear: try an HS one here,
+		 * before any of the big reads, and show which one took.
+		 */
+		sysimg_gear = 0;
+		sysimg_lanes = 0;
+		(void)ufs_hs_switch(&sysimg_gear, &sysimg_lanes);
+		sysimg_pwr = ufs_dme_get(0x1571);       /* PA_PWRMODE, after the switch */
+		stage_paint(0xFF000000u);
+		sysimg_status(0, want, started, first, sysimg_bounce, 0, 0);
+		if (bio == NULL || want == 0) {
+			print("sysimg: userdata %s, resident size %x\n", bio == NULL ? "not found" : "found",
+			    want);
+			fb_line(2, "userdata not found", 0xFFFF0000u);
+			for (;;) {
+				__asm__ volatile("wfi");
+			}
+		}
+		if (blocks * bio->media->block_size < want) {
+			print("sysimg: userdata %x blocks, image needs %x blocks\n", blocks,
+			    (want + bio->media->block_size - 1) / bio->media->block_size);
+			fb_line(2, "userdata too small", 0xFFFF0000u);
+			for (;;) {
+				__asm__ volatile("wfi");
+			}
+		}
+		/*
+		 * sysimg_test=1 (bring-up): read one megabyte twice, once into the
+		 * loader's own low buffer and once into the high address the kernel
+		 * window uses, and compare. Blue says they match and the full read
+		 * starts; red says the controller did not put the bytes where it was
+		 * told. Magenta after the full image means all of it came back; the
+		 * loader then stops there (no kernel, no log handoff), so the colour
+		 * is what a photo shows.
+		 */
+		if (sysimg_test) {
+			uint64_t probe = 0x100000;
+
+			if (probe > want) {
+				probe = want;
+			}
+			if (probe & (bio->media->block_size - 1)) {
+				probe = (probe + bio->media->block_size - 1) & ~(bio->media->block_size - 1);
+			}
+			efi_status s1 = bio->read_blocks(bio, bio->media->media_id, first, probe, ufs_buffer);
+			efi_status s2 = bio->read_blocks(bio, bio->media->media_id, first, probe,
+			    (void *)(uintptr_t)dest);
+			if (EFI_ERROR(s1) || EFI_ERROR(s2) || memcmp(ufs_buffer, (const void *)(uintptr_t)dest, probe) != 0) {
+				print("sysimg: high read test failed: %x %x, first %x %x %x %x / %x %x %x %x\n",
+				    (uint64_t)s1, (uint64_t)s2,
+				    (uint64_t)ufs_buffer[0], (uint64_t)ufs_buffer[1], (uint64_t)ufs_buffer[2],
+				    (uint64_t)ufs_buffer[3], (uint64_t)((const uint8_t *)(uintptr_t)dest)[0],
+				    (uint64_t)((const uint8_t *)(uintptr_t)dest)[1],
+				    (uint64_t)((const uint8_t *)(uintptr_t)dest)[2],
+				    (uint64_t)((const uint8_t *)(uintptr_t)dest)[3]);
+				stage_paint(STAGE_RED);
+				for (;;) {
+					__asm__ volatile("wfi");
+				}
+			}
+			stage_paint(STAGE_BLUE);
+			print("sysimg: high read test passed\n");
+		}
+		print("sysimg: %d MB from userdata lba %x to pa %x\n", want >> 20, first, dest);
+		{
+			uint64_t last_show = started;
+			uint64_t dma_ms = 0, copy_ms = 0;
+
+			while (done < want) {
+				uint64_t chunk = want - done;
+				uint64_t t0, t1, t2;
+				efi_status s;
+
+				if (chunk > 0x400000) {
+					chunk = 0x400000;
+				}
+				if (chunk & (bio->media->block_size - 1)) {
+					chunk = (chunk + bio->media->block_size - 1) & ~(bio->media->block_size - 1);
+				}
+				t0 = READ_SYSREG(CNTVCT_EL0);
+				if (sysimg_bounce) {
+					s = bio->read_blocks(bio, bio->media->media_id,
+					    first + done / bio->media->block_size, chunk, block_buffer);
+					t1 = READ_SYSREG(CNTVCT_EL0);
+					if (!EFI_ERROR(s)) {
+						memcpy((void *)(uintptr_t)(dest + done), block_buffer, chunk);
+					}
+					t2 = READ_SYSREG(CNTVCT_EL0);
+				} else {
+					s = bio->read_blocks(bio, bio->media->media_id,
+					    first + done / bio->media->block_size, chunk,
+					    (void *)(uintptr_t)(dest + done));
+					t1 = t2 = READ_SYSREG(CNTVCT_EL0);
+				}
+				dma_ms = (t1 - t0) * 1000 / READ_SYSREG(CNTFRQ_EL0);
+				copy_ms = (t2 - t1) * 1000 / READ_SYSREG(CNTFRQ_EL0);
+				if (EFI_ERROR(s)) {
+					print("sysimg: read at %d MB failed: %x\n", done >> 20, (uint64_t)s);
+					sysimg_status(done, want, started, first + done / bio->media->block_size,
+					    sysimg_bounce, dma_ms, copy_ms);
+					fb_line(2, "READ FAILED", 0xFFFF0000u);
+					for (;;) {
+						__asm__ volatile("wfi");
+					}
+				}
+				done += chunk;
+				if (done % (512ULL << 20) == 0 && done < want) {
+					print("sysimg: %d MB\n", done >> 20);
+				}
+				if (seconds_since(last_show) >= 1) {
+					last_show = READ_SYSREG(CNTVCT_EL0);
+					sysimg_status(done, want, started,
+					    first + done / bio->media->block_size, sysimg_bounce, dma_ms,
+					    copy_ms);
+				}
+				if (wdt_armed) {
+					wdt_pet();
+				}
+			}
+			sysimg_status(done, want, started, first + want / bio->media->block_size,
+			    sysimg_bounce, dma_ms, copy_ms);
+		}
+		{
+			const uint8_t *head = (const uint8_t *)(uintptr_t)dest;
+			int apfs = head[0x20] == 'N' && head[0x21] == 'X' && head[0x22] == 'S' &&
+			    head[0x23] == 'B';
+
+			print("sysimg: done in %d ms, head %x %x %x %x %x %x %x %x, at 20: %x %x %x %x\n",
+			    (READ_SYSREG(CNTVCT_EL0) - started) * 1000 / READ_SYSREG(CNTFRQ_EL0),
+			    (uint64_t)head[0], (uint64_t)head[1], (uint64_t)head[2], (uint64_t)head[3],
+			    (uint64_t)head[4], (uint64_t)head[5], (uint64_t)head[6], (uint64_t)head[7],
+			    (uint64_t)head[0x20], (uint64_t)head[0x21], (uint64_t)head[0x22],
+			    (uint64_t)head[0x23]);
+			fb_line(2, apfs ? "APFS NXSB ok" : "APFS magic BAD",
+			    apfs ? 0xFF00FF00u : 0xFFFF0000u);
+		}
+		if (sysimg_test) {
+			for (;;) {
+				__asm__ volatile("wfi");
+			}
+		}
 	}
 	if (battery_requested) {
 		charger_start();
 	}
 	if (ufs_requested >= 2) {
 		hc_init();              /* (ufs_native=: UEFI's transfer list kept, before anything reads) */
+	}
+	if (memmap_requested) {
+		print_memory_map();
 	}
 	if (ufs_requested >= 1) {
 		ufs_survey();
@@ -3357,8 +5397,35 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	if (kernel_mpidr != this_mpidr) {
 		print("the kernel will run on core %x (this is core %x)\n", kernel_mpidr, this_mpidr);
 	}
+	/*
+	 * The page the device tree offers as uart0 (MALACHITE_FAKE_UART): zero it and write it
+	 * back to memory, since the kernel maps it uncached. Its FR word then reads clear, so
+	 * the serial driver never waits for a transmit-ready bit that nothing would set.
+	 * Magenta on the panel after a failed boot means it stopped in here; the monitor paints
+	 * over it when the loader got through.
+	 */
+	stage_paint(STAGE_MAGENTA);
+	if (plat->uart == MALACHITE_FAKE_UART) {
+		volatile uint64_t *page = (volatile uint64_t *)(uintptr_t)MALACHITE_FAKE_UART;
+
+		for (unsigned i = 0; i < 0x1000 / sizeof(*page); i++) {
+			page[i] = 0;
+		}
+		flush_dcache(MALACHITE_FAKE_UART, MALACHITE_FAKE_UART + 0x1000);
+	}
+	stage_paint(STAGE_CYAN);
+	/*
+	 * monitor=1: leave a core behind drawing the kernel's own log from
+	 * loader_log while the kernel runs on this one. It needs no return, no
+	 * heartbeat and no cooperation, which is the only way to see a boot that
+	 * never comes back (the system image boot is one).
+	 */
+	if (monitor_requested && kernel_mpidr == this_mpidr) {
+		monitor_start(kernel_live, slide, ustacks_probe);
+	}
 	print("jumping to %x\n", entry_va + slide);
 	stage_paint(STAGE_WHITE);
+	stage_corner(STAGE_BLUE, 0, 0, 200);   /* still there = the kernel drew nothing */
 	flush_log();
 	/* From here on the kernel feeds the watchdog (boot-arg hv_wdt_pet, see loader_return.c in XNU). */
 	wdt_set_ms(60000);
@@ -3402,22 +5469,36 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 				hc_take_back(status == OTHER_CPU_HUNG ? "the kernel hung" : "the kernel did not start");
 			}
 			if (status == OTHER_CPU_HUNG) {
-				/* the kernel still has that core; what it logged can be had all the same */
+				/*
+				 * Bring-up: the kernel stopped showing signs of life. What it
+				 * said last is the only thing that explains why, so draw that
+				 * (the log the loader collected on the way out) and mark the
+				 * state with a red square in a corner, without painting over
+				 * the text.
+				 */
+				uint64_t n = loader_ctx[CTX_LOG_LEN];
+
 				print("THE KERNEL HUNG on core %x: no sign of life for %d seconds; its log follows\n", kernel_mpidr,
 				    (uint64_t)SILENCE_SECONDS);
-				set_result("hung", loader_ctx[CTX_LOG_LEN], 0);
-				write_logs((const char *)loader_ctx[CTX_LOG_PA], loader_ctx[CTX_LOG_LEN]);
-				return 1;
+				set_result("hung", n, 0);
+				fb_render_log((const char *)(uintptr_t)loader_ctx[CTX_LOG_PA], n, 0xFF00FF00u);
+				stage_corner(STAGE_RED, 1, 1, 200);
+				for (;;) {
+					__asm__ volatile("wfi");
+				}
 			} else if (status != 0) {
 				/* the kernel was told it would be on that core (return path, device tree): no second try */
+				stage_paint(STAGE_YELLOW);
+				stage_corner(0xFF000000u, 1, status == OTHER_CPU_NOT_STARTED ? 1 : 0, 200);
 				if (status == OTHER_CPU_NOT_STARTED) {
 					print("core %x was started but never arrived\n", kernel_mpidr);
 				} else {
 					print("core %x did not start: PSCI error %d\n", kernel_mpidr, (uint64_t)-status);
 				}
 				set_result("no-such-core", (uint64_t)(status < 0 ? -status : status), 0);
-				write_logs(NULL, 0);
-				return 1;
+				for (;;) {
+					__asm__ volatile("wfi");
+				}
 			}
 		} else {
 			jump_to_kernel(entry_va + slide, ba_pa);
@@ -3425,6 +5506,54 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	}
 
 	/* --- the kernel came back ------------------------------------------- */
+	if (kret_hold) {
+		/*
+		 * Bring-up: the kernel came back, and its log is where the return
+		 * stub left it. Draw the tail of it on the panel ourselves -- the EFI
+		 * console cannot show it, and the publish path to the firmware has
+		 * been unreliable -- then stop. The red square says it did return.
+		 * The two lines written on top are the return record itself: an
+		 * empty log is otherwise indistinguishable from a broken one.
+		 */
+		char buf[96];
+		unsigned n = 0;
+		const char *s;
+
+		fb_render_log((const char *)(uintptr_t)loader_ctx[CTX_LOG_PA],
+		    loader_ctx[CTX_LOG_LEN], 0xFF00FF00u);
+		s = "ret reason=";
+		while (*s) buf[n++] = *s++;
+		n += fb_u64(buf + n, loader_ctx[CTX_REASON]);
+		s = " esr=";
+		while (*s) buf[n++] = *s++;
+		n += fb_hex(buf + n, loader_ctx[CTX_ESR]);
+		s = " elr=";
+		while (*s) buf[n++] = *s++;
+		n += fb_hex(buf + n, loader_ctx[CTX_ELR]);
+		buf[n] = 0;
+		fb_line(0, buf, 0xFFFFFFFFu);
+
+		n = 0;
+		s = "far=";
+		while (*s) buf[n++] = *s++;
+		n += fb_hex(buf + n, loader_ctx[CTX_FAR]);
+		s = " log=";
+		while (*s) buf[n++] = *s++;
+		n += fb_u64(buf + n, loader_ctx[CTX_LOG_LEN]);
+		s = " bytes at ";
+		while (*s) buf[n++] = *s++;
+		n += fb_hex(buf + n, loader_ctx[CTX_LOG_PA]);
+		s = " el=";
+		while (*s) buf[n++] = *s++;
+		n += fb_hex(buf + n, other_cpu_el);
+		buf[n] = 0;
+		fb_line(1, buf, 0xFFFFFFFFu);
+
+		stage_corner(STAGE_RED, 1, 1, 100);
+		for (;;) {
+			__asm__ volatile("wfi");
+		}
+	}
 	wdt_set_ms(WDT_BITE_MS);
 	hc_take_back("the kernel came back");   /* before anything here touches the storage */
 	if (hc_known) {
@@ -4118,10 +6247,14 @@ efi_main(efi_handle image, efi_system_table *st)
 	/* One-shot mode: run the kernel that came with the image, then reset. */
 	if (have_payload) {
 		stage_paint(STAGE_MAGENTA);
-		run_kernel(0, 0);
-		stage_paint(STAGE_GREEN);
+		int ran = run_kernel(0, 0);
+
+		/* Cyan only when the kernel really ran and came back; every way to
+		 * fail before the jump leaves red, and a green panel is then the
+		 * kernel's own (it never returned), so a photo tells them apart. */
+		stage_paint(ran ? STAGE_CYAN : STAGE_RED);
 		if (pi.ret) {
-			/* Bring-up: give the firmware the log to print over its DEBUG console. */
+			/* Bring-up: hand the log to the firmware to print (XnuLoader.c). */
 			publish_log();
 			return 0;
 		}
