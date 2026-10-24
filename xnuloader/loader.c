@@ -1081,6 +1081,9 @@ static void monitor_heartbeat(void);
 static void monitor_sampler(void);
 static void sample_threads(const char *want);
 static uint32_t sampler_to_text(char *d, uint32_t cap, uint32_t at);
+static unsigned put_str(char *d, unsigned n, unsigned cap, const char *s);
+static unsigned put_hex(char *d, unsigned n, unsigned cap, uint64_t v);
+static unsigned put_dec(char *d, unsigned n, unsigned cap, uint64_t v);
 static uint64_t kslide;                /* the kernel's slide, as the monitor reads the log with */
 static unsigned fb_reserve_rows;       /* rows the monitor keeps for its footer */
 static unsigned monitor_cycle;         /* passes of the monitor loop: the heartbeat */
@@ -4039,6 +4042,12 @@ static struct {
 	int found;
 	char name[SAMPLER_NAME];
 	struct sampler_thread t[SAMPLER_THREADS];
+	/* what the walk saw, for when it does not find the process */
+	uint64_t dbg_head, dbg_first, dbg_first_pa, dbg_size;
+	unsigned dbg_walked;
+	int dbg_first_pa_ok;
+	char dbg_name[24];
+	uint64_t dbg_ptov[4][3];
 } sampler;
 
 static int
@@ -4141,9 +4150,34 @@ sample_threads(const char *want)
 	}
 	head = KV_TASKS + kslide;
 	node = *(volatile uint64_t *)(uintptr_t)head;
+
+	sampler.dbg_head = head;
+	sampler.dbg_first = node;
+	sampler.dbg_first_pa_ok = kva_to_pa(node, &sampler.dbg_first_pa);
+	sampler.dbg_size = size;
+	sampler.dbg_walked = 0;
+	sampler.dbg_name[0] = 0;
+	for (unsigned i = 0; i < 4; i++) {
+		sampler.dbg_ptov[i][0] = *(volatile uint64_t *)(uintptr_t)(KV_PTOV_TABLE + kslide + i * 0x18);
+		sampler.dbg_ptov[i][1] = *(volatile uint64_t *)(uintptr_t)(KV_PTOV_TABLE + kslide + i * 0x18 + 8);
+		sampler.dbg_ptov[i][2] = *(volatile uint64_t *)(uintptr_t)(KV_PTOV_TABLE + kslide + i * 0x18 + 0x10);
+	}
+
 	for (unsigned i = 0; i < 1024 && node != head; i++) {
 		task = node;            /* the queue holds element pointers, not chain addresses */
 		proc = task - size;
+		sampler.dbg_walked = i + 1;
+		if (i == 0) {
+			for (unsigned j = 0; j < 3; j++) {
+				uint64_t w;
+
+				if (!kread64(proc + KPROC_NAME + j * 8, &w)) {
+					break;
+				}
+				__builtin_memcpy(sampler.dbg_name + j * 8, &w, 8);
+			}
+			sampler.dbg_name[sizeof(sampler.dbg_name) - 1] = 0;
+		}
 		if (kname_is(proc + KPROC_NAME, want)) {
 			sampler.found = 1;
 			break;
@@ -4206,14 +4240,47 @@ monitor_sampler(void)
 	uint64_t rows;
 
 	if (!sampler.found) {
-		static const char none[] = "kernel sampler: lsd not found";
+		unsigned d = monitor_cycle % 7;
 
+		n = put_str(buf, 0, sizeof(buf) - 1, "sampler: lsd not found  ");
+		if (d == 0) {
+			n = put_str(buf, n, sizeof(buf) - 1, "head=");
+			n = put_hex(buf, n, sizeof(buf) - 1, sampler.dbg_head);
+			n = put_str(buf, n, sizeof(buf) - 1, " first=");
+			n = put_hex(buf, n, sizeof(buf) - 1, sampler.dbg_first);
+		} else if (d == 1) {
+			n = put_str(buf, n, sizeof(buf) - 1, "firstpa=");
+			n = put_hex(buf, n, sizeof(buf) - 1, sampler.dbg_first_pa);
+			n = put_str(buf, n, sizeof(buf) - 1, sampler.dbg_first_pa_ok ? " ok size=" : " FAIL size=");
+			n = put_hex(buf, n, sizeof(buf) - 1, sampler.dbg_size);
+		} else if (d == 2) {
+			n = put_str(buf, n, sizeof(buf) - 1, "walked=");
+			n = put_dec(buf, n, sizeof(buf) - 1, sampler.dbg_walked);
+			n = put_str(buf, n, sizeof(buf) - 1, " name=");
+			for (unsigned i = 0; i < 20 && sampler.dbg_name[i] != 0 && n < sizeof(buf) - 1; i++) {
+				char c = sampler.dbg_name[i];
+
+				buf[n++] = (c >= 32 && c < 127) ? c : '.';
+			}
+		} else {
+			unsigned i = d - 3;
+
+			n = put_str(buf, n, sizeof(buf) - 1, "ptov");
+			n = put_dec(buf, n, sizeof(buf) - 1, i);
+			n = put_str(buf, n, sizeof(buf) - 1, " pa=");
+			n = put_hex(buf, n, sizeof(buf) - 1, sampler.dbg_ptov[i][0]);
+			n = put_str(buf, n, sizeof(buf) - 1, " va=");
+			n = put_hex(buf, n, sizeof(buf) - 1, sampler.dbg_ptov[i][1]);
+			n = put_str(buf, n, sizeof(buf) - 1, " len=");
+			n = put_hex(buf, n, sizeof(buf) - 1, sampler.dbg_ptov[i][2]);
+		}
+		buf[n] = 0;
 		rows = (SCREEN.height > FB_Y0 + FB_CELL_H) ? (SCREEN.height - FB_Y0 - 8) / FB_CELL_H : 0;
 		if (rows < 2) {
 			return;
 		}
 		fb_row_clear(rows - 2);
-		fb_line((unsigned)(rows - 2), none, 0xFFFF8080u);
+		fb_line((unsigned)(rows - 2), buf, 0xFFFF8080u);
 		return;
 	}
 	for (unsigned i = 0; lead[i] != 0 && n < sizeof(buf) - 1; i++) {
@@ -4307,7 +4374,38 @@ sampler_to_text(char *d, uint32_t cap, uint32_t at)
 
 	n = put_str(d, n, cap, "\n== monitor thread sampler ==\n");
 	if (!sampler.found) {
-		return put_str(d, n, cap, "lsd: not found\n");
+		n = put_str(d, n, cap, "lsd: not found\n");
+		n = put_str(d, n, cap, "dbg head ");
+		n = put_hex(d, n, cap, sampler.dbg_head);
+		n = put_str(d, n, cap, " first ");
+		n = put_hex(d, n, cap, sampler.dbg_first);
+		n = put_str(d, n, cap, "\n");
+		n = put_str(d, n, cap, "dbg first pa ");
+		n = put_hex(d, n, cap, sampler.dbg_first_pa);
+		n = put_str(d, n, cap, sampler.dbg_first_pa_ok ? " ok size " : " FAIL size ");
+		n = put_hex(d, n, cap, sampler.dbg_size);
+		n = put_str(d, n, cap, " walked ");
+		n = put_dec(d, n, cap, sampler.dbg_walked);
+		n = put_str(d, n, cap, "\n");
+		n = put_str(d, n, cap, "dbg first name ");
+		for (unsigned i = 0; i < 20 && sampler.dbg_name[i] != 0 && n < cap; i++) {
+			char c = sampler.dbg_name[i];
+
+			d[n++] = (c >= 32 && c < 127) ? c : '.';
+		}
+		n = put_str(d, n, cap, "\n");
+		for (unsigned i = 0; i < 4; i++) {
+			n = put_str(d, n, cap, "dbg ptov");
+			n = put_dec(d, n, cap, i);
+			n = put_str(d, n, cap, " pa ");
+			n = put_hex(d, n, cap, sampler.dbg_ptov[i][0]);
+			n = put_str(d, n, cap, " va ");
+			n = put_hex(d, n, cap, sampler.dbg_ptov[i][1]);
+			n = put_str(d, n, cap, " len ");
+			n = put_hex(d, n, cap, sampler.dbg_ptov[i][2]);
+			n = put_str(d, n, cap, "\n");
+		}
+		return n;
 	}
 	n = put_str(d, n, cap, "process ");
 	n = put_str(d, n, cap, sampler.name);
