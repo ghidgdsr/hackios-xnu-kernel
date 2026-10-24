@@ -4099,10 +4099,23 @@ static struct {
 	int dbg_first_pa_ok;
 	char dbg_name[24];
 	uint64_t dbg_ptov[4][3];
+	uint64_t dbg_root_va, dbg_root_pa;
+	int dbg_root_ok;
 } sampler;
 
+/* The kernel's page tables: kernel_map addresses are not in the physmap windows. */
+#define KV_KERNEL_PMAP_STORE 0xfffffff007b93238ULL   /* struct pmap kernel_pmap_store */
+#define KPMAP_ROOT           0x00                   /* its level-0 table, a kernel VA */
+
 static int
-kva_to_pa(uint64_t va, uint64_t *pa)
+pa_ok(uint64_t pa)
+{
+	return pa >= 0x40000000ULL && pa < 0x400000000ULL;
+}
+
+/* The physical-memory windows phystokv uses (they cover the physmap, not kernel_map). */
+static int
+kva_to_pa_physmap(uint64_t va, uint64_t *pa)
 {
 	uint64_t table = KV_PTOV_TABLE + kslide;
 
@@ -4121,14 +4134,86 @@ kva_to_pa(uint64_t va, uint64_t *pa)
 			continue;
 		}
 		pa_i += va - va_i;
-		/* keep the read inside the phone's DRAM */
-		if (pa_i < 0x40000000ULL || pa_i >= 0x400000000ULL) {
+		if (!pa_ok(pa_i)) {
 			return 0;
 		}
 		*pa = pa_i;
 		return 1;
 	}
 	return 0;
+}
+
+/* The kernel image itself, the one range the loader's slide maps. */
+static int
+kva_to_pa_image(uint64_t va, uint64_t *pa)
+{
+	if (va < 0xfffffff007004000ULL || va >= 0xfffffff008400000ULL) {
+		return 0;
+	}
+	*pa = va + kslide;
+	return pa_ok(*pa);
+}
+
+static int
+kpa_read64(uint64_t pa, uint64_t *out)
+{
+	if (!pa_ok(pa) || !pa_ok(pa + 7)) {
+		return 0;
+	}
+	*out = *(volatile uint64_t *)(uintptr_t)pa;
+	return 1;
+}
+
+/*
+ * A walk of the kernel's own tables, as pmap_vtophys does it: the root is a kernel VA in
+ * kernel_pmap_store, its entries hold the next table's physical address, the indices are
+ * (va >> 30) & 0xff, (va >> 21) & 0x1ff and (va >> 12) & 0x1ff, and the masks come from
+ * the kernel's level-info table (1 GB, 2 MB, 4 KB).
+ */
+static int
+kva_to_pa_pmap(uint64_t va, uint64_t *pa)
+{
+	uint64_t root_va = *(volatile uint64_t *)(uintptr_t)(KV_KERNEL_PMAP_STORE + kslide);
+	uint64_t root_pa, e, idx;
+
+	if (root_va == 0) {
+		return 0;
+	}
+	if (!kva_to_pa_physmap(root_va, &root_pa) && !kva_to_pa_image(root_va, &root_pa)) {
+		return 0;
+	}
+	idx = (va >> 30) & 0xff;
+	if (!kpa_read64(root_pa + idx * 8, &e) || (e & 1) == 0) {
+		return 0;
+	}
+	if ((e & 2) == 0) {                     /* a 1 GB block */
+		*pa = (e & ~0x3fffffffULL) | (va & 0x3fffffffULL);
+		return pa_ok(*pa);
+	}
+	root_pa = e & 0x0000fffffffff000ULL;
+
+	idx = (va >> 21) & 0x1ff;
+	if (!kpa_read64(root_pa + idx * 8, &e) || (e & 1) == 0) {
+		return 0;
+	}
+	if ((e & 2) == 0) {                     /* a 2 MB block */
+		*pa = (e & ~0x1fffffULL) | (va & 0x1fffffULL);
+		return pa_ok(*pa);
+	}
+	root_pa = e & 0x0000fffffffff000ULL;
+
+	idx = (va >> 12) & 0x1ff;
+	if (!kpa_read64(root_pa + idx * 8, &e) || (e & 3) != 3) {
+		return 0;
+	}
+	*pa = (e & 0x0000fffffffff000ULL) | (va & 0xfff);
+	return pa_ok(*pa);
+}
+
+static int
+kva_to_pa(uint64_t va, uint64_t *pa)
+{
+	return kva_to_pa_physmap(va, pa) || kva_to_pa_image(va, pa) || kva_to_pa_pmap(va, pa);
 }
 
 static int
@@ -4213,6 +4298,10 @@ sample_threads(const char *want)
 		sampler.dbg_ptov[i][1] = *(volatile uint64_t *)(uintptr_t)(KV_PTOV_TABLE + kslide + i * 0x18 + 8);
 		sampler.dbg_ptov[i][2] = *(volatile uint64_t *)(uintptr_t)(KV_PTOV_TABLE + kslide + i * 0x18 + 0x10);
 	}
+	sampler.dbg_root_va = *(volatile uint64_t *)(uintptr_t)(KV_KERNEL_PMAP_STORE + kslide);
+	sampler.dbg_root_pa = 0;
+	sampler.dbg_root_ok = kva_to_pa_physmap(sampler.dbg_root_va, &sampler.dbg_root_pa) ||
+	    kva_to_pa_image(sampler.dbg_root_va, &sampler.dbg_root_pa);
 
 	for (unsigned i = 0; i < 1024 && node != head; i++) {
 		task = node;            /* the queue holds element pointers, not chain addresses */
@@ -4291,7 +4380,7 @@ monitor_sampler(void)
 	uint64_t rows;
 
 	if (!sampler.found) {
-		unsigned d = monitor_cycle % 8;
+		unsigned d = monitor_cycle % 9;
 
 		n = put_str(buf, 0, sizeof(buf) - 1, "sampler: lsd not found  ");
 		if (d == 0) {
@@ -4324,9 +4413,14 @@ monitor_sampler(void)
 			n = put_hex(buf, n, sizeof(buf) - 1, sampler.dbg_ptov[i][1]);
 			n = put_str(buf, n, sizeof(buf) - 1, " len=");
 			n = put_hex(buf, n, sizeof(buf) - 1, sampler.dbg_ptov[i][2]);
-		} else {
+		} else if (d == 7) {
 			n = put_str(buf, n, sizeof(buf) - 1, "sysimg crc=");
 			n = put_hex(buf, n, sizeof(buf) - 1, monitor_args.sysimg_crc);
+		} else {
+			n = put_str(buf, n, sizeof(buf) - 1, "pmap root=");
+			n = put_hex(buf, n, sizeof(buf) - 1, sampler.dbg_root_va);
+			n = put_str(buf, n, sizeof(buf) - 1, sampler.dbg_root_ok ? " ok pa=" : " FAIL pa=");
+			n = put_hex(buf, n, sizeof(buf) - 1, sampler.dbg_root_pa);
 		}
 		buf[n] = 0;
 		rows = (SCREEN.height > FB_Y0 + FB_CELL_H) ? (SCREEN.height - FB_Y0 - 8) / FB_CELL_H : 0;
