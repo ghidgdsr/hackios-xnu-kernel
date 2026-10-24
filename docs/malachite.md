@@ -2,8 +2,9 @@
 
 The first MediaTek port in this tree: the Xiaomi POCO X7 / Redmi Note 14 Pro 5G
 (`malachite`), with the MediaTek MT6878 (Dimensity 7300-Ultra). It boots iOS 16.5
-userland — launchd and lsd run, the boot then stalls in lsd — and it is where the
-loader's log monitor and saved-log facilities were worked out.
+userland — launchd and lsd run — but the userland does not come up properly yet:
+lsd and usermanagerd log errors frequently and the cause is being located. It is
+where the loader's log monitor and saved-log facilities were worked out.
 
 ## The device
 
@@ -104,15 +105,15 @@ fastboot reboot
 
 | Component | State |
 | --- | --- |
-| UEFI | boots, Boot Manager menu |
+| UEFI | boots straight into the XNU loader (no boot menu) |
 | XNU | boots on core 0 |
-| iOS userland | launchd and lsd run; stalls in lsd about 83 s in |
+| iOS userland | does not start properly; lsd and usermanagerd log errors frequently, cause under investigation |
 | UFS | root works (system image as `md0`) |
 | Display | loader text only (LK framebuffer) |
 | GPU / touch / USB / Wi-Fi / audio | not implemented |
 
-The stall is under investigation; `ustacks` sampling and the saved-log viewer
-exist for it. Two kinds of log noise are expected and not the cause: persona
+The userland failure is under investigation; `ustacks` sampling and the
+saved-log viewer exist for it. Two kinds of log noise are expected and not the cause: persona
 lookups return ESRCH because there is no persona subsystem, and MCM refuses to
 set a Data Protection class because there is no AKS/SEP.
 
